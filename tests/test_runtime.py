@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -10,7 +11,14 @@ from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
 from skill_temple.evals import evaluate_file
-from skill_temple.runtime import SkillPathError, SkillRuntime, SkillRuntimeError, load_runtime
+from skill_temple.runtime import (
+    DEFAULT_MANIFEST_MAX_CHARS,
+    RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+    SkillPathError,
+    SkillRuntime,
+    SkillRuntimeError,
+    load_runtime,
+)
 
 
 def _write_skill(
@@ -64,6 +72,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertGreater(result["matches"][0]["confidence"], 0.5)
         self.assertIn("description", result["matches"][0])
 
+    def test_resolve_does_not_match_skill_name_inside_another_word(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            _write_skill(skills_root, "ida", "Use for IDA analysis.", "# IDA")
+            runtime = SkillRuntime(skills_root)
+
+            self.assertEqual(runtime.resolve("validate this configuration")["matches"], [])
+            explicit = runtime.resolve("use @ida for this database")
+            self.assertEqual(explicit["matches"][0]["skill_id"], "ida")
+
     def test_retrieve_returns_complete_skill_entrypoint(self) -> None:
         runtime = load_runtime()
         result = runtime.retrieve(
@@ -81,6 +99,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(selected["next_start_line"])
         self.assertIn("docs/idautils.md", selected["referenced_paths"])
         self.assertIn("docs/ida_hexrays.md", selected["referenced_paths"])
+        self.assertNotIn("confidence", selected)
         self.assertNotIn("operating_rules", selected)
         self.assertNotIn("response_contract", selected)
         self.assertNotIn("evidence", selected)
@@ -130,6 +149,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("name: idapython", result["content"])
         self.assertTrue(result["truncated"])
         self.assertEqual(result["next_start_line"], 6)
+
+    def test_read_returns_an_oversized_single_line_without_losing_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            long_line = "X" * 100
+            _write_skill(
+                skills_root,
+                "demo",
+                "Use for long-line tests.",
+                "# Demo",
+                {"docs/long.txt": long_line},
+            )
+            runtime = SkillRuntime(skills_root)
+
+            result = runtime.read("demo", "docs/long.txt", max_chars=10)
+
+            self.assertEqual(result["content"], long_line)
+            self.assertFalse(result["truncated"])
+            self.assertIsNone(result["next_start_line"])
 
     def test_read_rejects_unsafe_or_invalid_ranges(self) -> None:
         runtime = load_runtime()
@@ -200,6 +238,20 @@ class RuntimeTests(unittest.TestCase):
             result = runtime.retrieve("@nested task", hinted_skill_ids=["nested"])
             self.assertEqual(result["selected_skills"][0]["skill_id"], "nested")
 
+    def test_runtime_prunes_directories_beyond_the_scan_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            accepted_parent = skills_root.joinpath(*[f"a{index}" for index in range(5)])
+            rejected_parent = skills_root.joinpath(*[f"b{index}" for index in range(6)])
+            _write_skill(accepted_parent, "accepted", "Use for accepted tasks.", "# Accepted")
+            _write_skill(rejected_parent, "rejected", "Use for rejected tasks.", "# Rejected")
+
+            runtime = SkillRuntime(skills_root)
+            skill_ids = {skill["skill_id"] for skill in runtime.list_skills()["skills"]}
+
+            self.assertIn("accepted", skill_ids)
+            self.assertNotIn("rejected", skill_ids)
+
     def test_duplicate_frontmatter_names_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
@@ -250,6 +302,46 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(chained["selected_skills"][1]["role"], "secondary")
             self.assertTrue(chained["debug"]["allow_skill_chaining"])
 
+    def test_multiple_skills_share_a_global_instruction_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            large_body = "# Large\n\n" + "\n".join("X" * 200 for _ in range(220))
+            skill_ids = ["alpha", "beta", "gamma"]
+            for skill_id in skill_ids:
+                _write_skill(
+                    skills_root,
+                    skill_id,
+                    f"Use {skill_id} for shared-budget tasks.",
+                    large_body,
+                )
+            runtime = SkillRuntime(skills_root)
+
+            result = runtime.retrieve(
+                "@alpha @beta @gamma shared-budget",
+                hinted_skill_ids=skill_ids,
+                max_skills=3,
+                allow_skill_chaining=True,
+                include_debug=True,
+            )
+
+            instruction_lengths = [
+                len(packet["instructions"]) for packet in result["selected_skills"]
+            ]
+            self.assertLessEqual(sum(instruction_lengths), RETRIEVE_INSTRUCTIONS_MAX_CHARS)
+            self.assertTrue(
+                all(length <= DEFAULT_MANIFEST_MAX_CHARS for length in instruction_lengths)
+            )
+            self.assertTrue(all(packet["truncated"] for packet in result["selected_skills"]))
+            self.assertEqual(
+                result["debug"]["used_instruction_chars"],
+                sum(instruction_lengths),
+            )
+            self.assertEqual(
+                result["debug"]["instruction_char_limit"],
+                RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+            )
+            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
+
     def test_retrieve_returns_no_skill_for_unmatched_task(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
@@ -299,6 +391,7 @@ class RuntimeTests(unittest.TestCase):
             {"query", "hinted_skill_ids", "allow_skill_chaining"},
         )
         selected_schema = schema["components"]["schemas"]["SelectedSkillPacket"]
+        self.assertNotIn("confidence", selected_schema["properties"])
         for field in [
             "source_path",
             "instructions",

@@ -108,7 +108,6 @@ class SelectedSkillPacket(BaseModel):
     name: str
     description: str
     role: Literal["primary", "secondary"]
-    confidence: float
     source_path: str
     instructions: str
     content_hash: str
@@ -380,13 +379,9 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         response_model=RetrieveSkillContextResponse,
         response_model_exclude_none=True,
         responses={404: {"model": StructuredErrorResponse}},
-        summary=(
-            "Select matching skills and return each SKILL.md in full."
-        ),
+        summary="Select matching skills and return SKILL.md instructions.",
         description=(
-            "Default first Action call for skill-backed tasks. Read every returned SKILL.md "
-            "completely, then follow its instructions and read only the referenced resources "
-            "needed for the task."
+            "Select matching skills and return their SKILL.md instructions."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -406,8 +401,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Search documentation for a specific skill.",
         description=(
-            "Fallback search inside one selected skill when SKILL.md does not identify an "
-            "exact resource path. Prefer readSkillContent for paths named by SKILL.md."
+            "Search indexed resources within one selected skill."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -438,8 +432,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Read a skill file by safe relative path.",
         description=(
-            "Read a resource explicitly referenced by a selected SKILL.md. Continue with "
-            "start_line until the selected resource has been read completely."
+            "Read an exact safe relative path within one selected skill."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )

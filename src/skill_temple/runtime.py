@@ -36,7 +36,8 @@ _API_SYMBOL_RE = re.compile(
 )
 
 DEFAULT_MAX_SKILLS = 1
-DEFAULT_MANIFEST_MAX_CHARS = 32_000
+DEFAULT_MANIFEST_MAX_CHARS = 24_000
+RETRIEVE_INSTRUCTIONS_MAX_CHARS = 60_000
 DOTENV_FILE_NAME = ".env"
 MAX_SKILL_SCAN_DEPTH = 6
 _TEXT_REFERENCE_SUFFIXES = {".md", ".rst", ".txt"}
@@ -161,6 +162,13 @@ def _content_hash(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
 
+def _alias_matches(alias: str, query_lower: str) -> bool:
+    if not alias:
+        return False
+    boundary_pattern = rf"(?<![A-Za-z0-9_]){re.escape(alias.lower())}(?![A-Za-z0-9_])"
+    return re.search(boundary_pattern, query_lower) is not None
+
+
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     """Parse the YAML frontmatter used by Codex-style ``SKILL.md`` files."""
 
@@ -202,12 +210,7 @@ class SkillRuntime:
 
     def _load_skills(self) -> dict[str, Skill]:
         skills: dict[str, Skill] = {}
-        for manifest_path in sorted(self.skills_dir.rglob("SKILL.md")):
-            relative = manifest_path.relative_to(self.skills_dir)
-            if len(relative.parts) > MAX_SKILL_SCAN_DEPTH + 1:
-                continue
-            if any(part.startswith(".") or part == "__pycache__" for part in relative.parts[:-1]):
-                continue
+        for manifest_path in self._iter_skill_manifests():
             skill = self._load_skill(manifest_path)
             if skill.skill_id in skills:
                 other = skills[skill.skill_id].root
@@ -216,6 +219,22 @@ class SkillRuntime:
                 )
             skills[skill.skill_id] = skill
         return skills
+
+    def _iter_skill_manifests(self) -> list[Path]:
+        manifests: list[Path] = []
+        for current_root, dir_names, file_names in os.walk(self.skills_dir, topdown=True):
+            current_path = Path(current_root)
+            depth = len(current_path.relative_to(self.skills_dir).parts)
+            dir_names[:] = sorted(
+                name
+                for name in dir_names
+                if not name.startswith(".") and name != "__pycache__"
+            )
+            if depth >= MAX_SKILL_SCAN_DEPTH:
+                dir_names[:] = []
+            if "SKILL.md" in file_names:
+                manifests.append(current_path / "SKILL.md")
+        return sorted(manifests)
 
     def _load_skill(self, manifest_path: Path) -> Skill:
         text = manifest_path.read_text(encoding="utf-8", errors="replace")
@@ -268,7 +287,7 @@ class SkillRuntime:
 
             for alias in skill.aliases:
                 alias_lower = alias.lower()
-                if alias_lower and alias_lower in query_lower:
+                if _alias_matches(alias_lower, query_lower):
                     score += 25.0 if alias.startswith("@") else 12.0
                     reasons.append(f"matched skill name {alias!r}")
 
@@ -315,23 +334,32 @@ class SkillRuntime:
         selected_matches = resolved["matches"][:effective_max]
         selected: list[dict[str, Any]] = []
         any_truncated = False
+        remaining_instruction_chars = RETRIEVE_INSTRUCTIONS_MAX_CHARS
+        used_instruction_chars = 0
 
         for index, match in enumerate(selected_matches):
             skill = self._get_skill(match["skill_id"])
+            remaining_skill_count = len(selected_matches) - index
+            skill_instruction_budget = min(
+                DEFAULT_MANIFEST_MAX_CHARS,
+                max(1, remaining_instruction_chars // remaining_skill_count),
+            )
             manifest = self.read(
                 skill.skill_id,
                 skill.entrypoint,
                 start_line=1,
                 max_lines=5000,
-                max_chars=DEFAULT_MANIFEST_MAX_CHARS,
+                max_chars=skill_instruction_budget,
             )
+            instruction_chars = len(manifest["content"])
+            remaining_instruction_chars -= instruction_chars
+            used_instruction_chars += instruction_chars
             any_truncated = any_truncated or manifest["truncated"]
             packet: dict[str, Any] = {
                 "skill_id": skill.skill_id,
                 "name": skill.name,
                 "description": skill.description,
                 "role": "primary" if index == 0 else "secondary",
-                "confidence": match["confidence"],
                 "source_path": skill.entrypoint,
                 "instructions": manifest["content"],
                 "content_hash": manifest["content_hash"],
@@ -378,6 +406,8 @@ class SkillRuntime:
             result["debug"] = {
                 "available_skill_count": len(self._skills),
                 "allow_skill_chaining": allow_skill_chaining,
+                "instruction_char_limit": RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+                "used_instruction_chars": used_instruction_chars,
                 "resolved_matches": resolved["matches"],
             }
         return result
@@ -454,8 +484,8 @@ class SkillRuntime:
             if selected and char_count + added > max_chars:
                 break
             if not selected and len(line) > max_chars:
-                selected.append(line[:max_chars])
-                char_count = max_chars
+                selected.append(line)
+                char_count = len(line)
                 end = line_number
                 break
             selected.append(line)

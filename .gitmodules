@@ -1,4 +1,3 @@
 [submodule "external/ida-script-mcp-main"]
 	path = external/ida-script-mcp-main
 	url = https://github.com/qqq694637644/ida-script-mcp-main
-	branch = gpt/add-idapython-skill-metadata

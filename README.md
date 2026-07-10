@@ -84,7 +84,6 @@ A selected skill packet contains:
   "name": "idapython",
   "description": "Use for IDAPython scripting...",
   "role": "primary",
-  "confidence": 0.99,
   "source_path": "SKILL.md",
   "instructions": "---\nname: idapython\n...",
   "content_hash": "sha256:...",
@@ -95,7 +94,9 @@ A selected skill packet contains:
 }
 ```
 
-`instructions` is the complete selected `SKILL.md`. After receiving it, do not call `retrieveSkillContext` again without a concrete reason.
+`instructions` contains the selected `SKILL.md` within the response budget. When
+`truncated=true`, continue the same `SKILL.md` through `readSkillContent` from
+`next_start_line`. Do not call `retrieveSkillContext` again just to continue it.
 
 ### Read a referenced resource
 
@@ -126,6 +127,11 @@ Use search only when the selected `SKILL.md` does not identify an exact relevant
 
 Set `allow_skill_chaining=true` only when the task clearly needs multiple domains. The runtime returns up to three top matching skills with `primary` and `secondary` roles.
 
+Skill entrypoints share a 60,000-character response budget. A single selected
+`SKILL.md` receives at most 24,000 characters; multi-skill responses divide the
+remaining budget dynamically. Truncated entrypoints expose `next_start_line` for
+continued reading through `readSkillContent`.
+
 For every selected skill:
 
 1. read its returned `instructions` completely;
@@ -153,7 +159,7 @@ IDA-Script-MCP plugin
 
 The Custom GPT calls only the FastAPI/OpenAPI surface. It does not call the MCP transport or the raw IDA plugin port directly.
 
-For current IDB facts, use live IDA Actions rather than documentation or assumptions. `executeIdapython` is available for custom analysis, bulk processing, renaming, comments, patches, type changes, and validation. Inspect `status`, `stdout`, `stderr`, `result`, and `error` before reporting success. After a mutation, perform a targeted read-back when the execution response alone does not prove the change.
+For current IDB facts, use live IDA Actions rather than documentation or assumptions. `executeIdapython` is available for custom analysis, bulk processing, renaming, comments, patches, type changes, and validation. The GPT Action adapter accepts `timeout_seconds` from 1 to 35 seconds so the plugin timeout plus its 5-second response margin remains within the Action round trip. Inspect `status`, `stdout`, `stderr`, `result`, and `error` before reporting success. Keep mutations within the user's requested scope and perform a targeted read-back when the execution response alone does not prove the change.
 
 ## Configuration
 

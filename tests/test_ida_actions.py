@@ -157,6 +157,30 @@ def test_execute_idapython_reports_plugin_response_timeout(monkeypatch) -> None:
     assert body["port"] == 13338
 
 
+def test_execute_idapython_timeout_is_bounded_for_gpt_actions(monkeypatch) -> None:
+    fake_server = FakeIdaServer()
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
+    client = TestClient(create_app())
+
+    execute_schema = client.get("/openapi.json").json()["components"]["schemas"][
+        "ExecuteIdapythonRequest"
+    ]
+    assert execute_schema["properties"]["timeout_seconds"]["maximum"] == 35
+
+    too_long = client.post(
+        "/v1/ida/execute",
+        json={"code": "result = 1", "timeout_seconds": 36},
+    )
+    assert too_long.status_code == 422
+
+    accepted = client.post(
+        "/v1/ida/execute",
+        json={"code": "result = 1", "timeout_seconds": 35},
+    )
+    assert accepted.status_code == 200
+    assert fake_server.requests[-1]["timeout"] == 40.0
+
+
 def test_decompile_and_xrefs_require_one_target(monkeypatch) -> None:
     monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: FakeIdaServer())
     client = TestClient(create_app())
@@ -173,3 +197,4 @@ def test_ida_script_mcp_submodule_is_recorded() -> None:
 
     assert "external/ida-script-mcp-main" in gitmodules
     assert "https://github.com/qqq694637644/ida-script-mcp-main" in gitmodules
+    assert "branch =" not in gitmodules

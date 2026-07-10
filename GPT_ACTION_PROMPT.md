@@ -25,7 +25,7 @@
 
 当用户明确点名某个 Skill，或任务明显符合某个 Skill 的用途时，调用 retrieveSkillContext。把用户原始任务放进 query；明确知道 skill_id 时放进 hinted_skill_ids。只有任务确实需要多个领域时才设置 allow_skill_chaining=true。
 
-retrieveSkillContext 返回的每个 selected_skills 项都包含完整 SKILL.md，位于 instructions 字段。对每个实际需要的 Skill：
+retrieveSkillContext 返回的每个 selected_skills 项都在 instructions 字段中包含所选 SKILL.md 的内容。若 truncated=true，使用 readSkillContent 读取同一 Skill 的 SKILL.md，并从 next_start_line 继续。对每个实际需要的 Skill：
 
 1. 完整阅读 instructions，不要只读其中一部分。
 2. 遵守其中的工作流、限制、资源路由和完成条件。
@@ -43,7 +43,7 @@ retrieveSkillContext 返回的每个 selected_skills 项都包含完整 SKILL.md
 
 目标实例不明确时调用 listIdaInstances。需要确认数据库身份、架构、image base 或输入文件时调用 getIdaDatabaseInfo。直接读取任务优先使用 listIdaFunctions、decompileIdaFunction 或 getIdaXrefs。
 
-自定义分析、批量处理、重命名、注释、patch、类型修改或专用验证可以使用 executeIdapython。这是可信的个人工作流；用户意图清楚时不要额外增加确认步骤。
+自定义分析、批量处理、重命名、注释、patch、类型修改或专用验证可以使用 executeIdapython。这是可信的个人工作流；用户意图清楚时不要额外增加确认步骤。所有修改必须限制在用户明确请求的范围内，不要因为推测便利而扩大修改范围。
 
 executeIdapython 返回后检查 status、stdout、stderr、result 和 error。遇到 timeout、plugin_response_timeout、busy 或 error 时按真实状态报告，不要假设执行完成。发生修改后，如果响应本身不足以证明结果，执行一次针对性的读回验证。
 

@@ -22,6 +22,7 @@ IDA_ERROR_HINT = (
     "In IDA, use Edit -> Plugins -> IDA-Script-MCP (Ctrl+Alt+S)."
 )
 PLUGIN_RESPONSE_TIMEOUT_MARGIN_SECONDS = 5
+GPT_ACTION_EXECUTION_TIMEOUT_MAX_SECONDS = 35
 
 
 class StrictIdaRequest(BaseModel):
@@ -89,7 +90,12 @@ class ExecuteIdapythonRequest(IdaTargetRequest):
         description="Path to a Python script file readable by the IDA machine.",
     )
     capture_output: bool = True
-    timeout_seconds: int = Field(default=30, ge=1, le=600)
+    timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=GPT_ACTION_EXECUTION_TIMEOUT_MAX_SECONDS,
+        description="IDA execution timeout in seconds. Capped for the GPT Action round trip.",
+    )
 
     @model_validator(mode="after")
     def validate_source(self) -> ExecuteIdapythonRequest:
