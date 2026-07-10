@@ -70,13 +70,6 @@ There are two valid deployment shapes.
 
 The FastAPI gateway imports `ida_script_mcp.server` from the editable submodule install and reuses the existing target-resolution and IDA-plugin HTTP transport logic.
 
-#### Optional shape: separate local adapter service
-
-```text
-127.0.0.1:8001   Skill Temple / skill retrieval service
-127.0.0.1:8002   IDA GPT Actions adapter service
-127.0.0.1:13338  IDA-Script-MCP plugin inside IDA
-```
 
 This is only worth doing if the IDA Action surface grows large. For the first implementation, prefer a single OpenAPI schema from `ida_skill` because Custom GPT configuration is simpler.
 
