@@ -319,24 +319,10 @@ Invoke-RestMethod http://127.0.0.1:8765/v1/skills/read `
 
 ## Suggested GPT Instructions
 
-```text
-When a user task appears to require a reusable skill, use retrieveSkillContext
-with the user's task and any explicit skill hint, such as @idapython.
-
-Use the returned operating_rules, evidence, response_contract, and
-validation_guidance as the behavioral source of truth.
-Call searchSkillDocs or readSkillContent only when the retrieved context is
-insufficient for the user's concrete request.
-
-Prefer answering with the minimum sufficient skill context.
-Stop retrieving once you can satisfy the user's core request with accurate,
-task-relevant evidence.
-
-For IDA/IDAPython tasks:
-- Prefer structured read-only tools before custom execution.
-- Use execute_idapython only when structured tools are insufficient.
-- Never apply mutations without explicit user confirmation and dry-run review.
-```
+Use [`GPT_ACTION_PROMPT.md`](GPT_ACTION_PROMPT.md) as the Custom GPT Instructions
+prompt for GPT-5.5. It uses the GPT Action operation names such as
+`executeIdapython`, keeps the workflow concise, and matches the personal-use
+policy where all public operations are non-consequential.
 
 ## Retrieval evals
 
