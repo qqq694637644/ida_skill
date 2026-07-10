@@ -13,7 +13,9 @@ from skill_temple.app import create_app
 from skill_temple.evals import evaluate_file
 from skill_temple.runtime import (
     DEFAULT_MANIFEST_MAX_CHARS,
+    DEFAULT_MAX_SKILLS,
     RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+    SKILL_CATALOG_MAX_CHARS,
     SKILL_DESCRIPTION_MAX_CHARS,
     SKILL_NAME_MAX_CHARS,
     SkillPathError,
@@ -179,7 +181,8 @@ class RuntimeTests(unittest.TestCase):
         selected = result["selected_skills"][0]
         self.assertIn("why_selected", selected["debug"])
         self.assertGreaterEqual(result["debug"]["available_skill_count"], 1)
-        self.assertFalse(result["debug"]["allow_skill_chaining"])
+        self.assertFalse(result["debug"]["allow_skill_chaining_requested"])
+        self.assertFalse(result["debug"]["automatic_skill_chaining"])
         self.assertTrue(result["debug"]["resolved_matches"])
 
     def test_search_finds_reference_then_recommends_read(self) -> None:
@@ -355,7 +358,7 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(SkillRuntimeError, "description exceeds"):
                 SkillRuntime(skills_root)
 
-    def test_multiple_skills_require_explicit_chaining(self) -> None:
+    def test_multiple_explicit_skills_auto_chain_without_a_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             for skill_id in ["alpha", "beta"]:
@@ -367,8 +370,11 @@ class RuntimeTests(unittest.TestCase):
                 )
 
             runtime = SkillRuntime(skills_root)
-            single = runtime.retrieve(
-                "@alpha @beta shared-task",
+            mentioned = runtime.retrieve(
+                "@alpha $beta shared-task",
+            )
+            hinted = runtime.retrieve(
+                "shared-task",
                 hinted_skill_ids=["alpha", "beta"],
             )
             chained = runtime.retrieve(
@@ -379,11 +385,66 @@ class RuntimeTests(unittest.TestCase):
                 include_debug=True,
             )
 
-            self.assertEqual(len(single["selected_skills"]), 1)
+            self.assertEqual(
+                [item["skill_id"] for item in mentioned["selected_skills"]],
+                ["alpha", "beta"],
+            )
+            self.assertEqual(len(hinted["selected_skills"]), 2)
             self.assertEqual(len(chained["selected_skills"]), 2)
             self.assertEqual(chained["selected_skills"][0]["role"], "primary")
             self.assertEqual(chained["selected_skills"][1]["role"], "secondary")
-            self.assertTrue(chained["debug"]["allow_skill_chaining"])
+            self.assertTrue(chained["debug"]["allow_skill_chaining_requested"])
+            self.assertTrue(chained["debug"]["automatic_skill_chaining"])
+            self.assertFalse(hinted["catalog_included"])
+            self.assertEqual(hinted["available_skills"], [])
+
+    def test_too_many_explicit_skills_are_not_partially_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_ids = ["alpha", "beta", "gamma", "delta"]
+            for skill_id in skill_ids:
+                _write_skill(
+                    skills_root,
+                    skill_id,
+                    f"Use {skill_id} for explicit selection tests.",
+                    f"# {skill_id}",
+                )
+
+            runtime = SkillRuntime(skills_root)
+            result = runtime.retrieve("@alpha @beta @gamma @delta do work")
+            hinted = runtime.retrieve("do work", hinted_skill_ids=skill_ids)
+
+            for response in [result, hinted]:
+                self.assertEqual(response["selected_skills"], [])
+                self.assertEqual(response["explicit_skill_ids"], skill_ids)
+                self.assertEqual(
+                    response["omitted_explicit_skill_ids"],
+                    skill_ids[DEFAULT_MAX_SKILLS:],
+                )
+                self.assertEqual(
+                    response["decision"]["next_action"],
+                    "retryWithFewerSkills",
+                )
+                self.assertFalse(response["decision"]["selected"])
+                self.assertTrue(response["catalog_included"])
+
+    def test_unknown_explicit_mentions_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            _write_skill(skills_root, "alpha", "Use for alpha tasks.", "# Alpha")
+            runtime = SkillRuntime(skills_root)
+
+            missing = runtime.retrieve("@missing do work")
+            self.assertEqual(missing["selected_skills"], [])
+            self.assertEqual(missing["unknown_skill_mentions"], ["missing"])
+            self.assertEqual(missing["decision"]["next_action"], "selectSkillOrAnswer")
+            self.assertIn("unavailable", missing["decision"]["reason"].lower())
+
+            mixed = runtime.retrieve("$alpha @missing do work")
+            self.assertEqual(mixed["selected_skills"][0]["skill_id"], "alpha")
+            self.assertEqual(mixed["unknown_skill_mentions"], ["missing"])
+            self.assertIn("missing", mixed["decision"]["reason"])
+            self.assertFalse(mixed["catalog_included"])
 
     def test_multiple_skills_share_a_global_instruction_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -448,6 +509,74 @@ class RuntimeTests(unittest.TestCase):
                 hinted_skill_ids=["alpha"],
             )
             self.assertEqual(selected["selected_skills"][0]["skill_id"], "alpha")
+            self.assertEqual(selected["available_skills"], [])
+            self.assertFalse(selected["catalog_included"])
+
+    def test_skill_catalog_has_an_independent_response_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            for index in range(140):
+                skill_id = f"skill{index:03d}"
+                _write_skill(
+                    skills_root,
+                    skill_id,
+                    f"Use {skill_id} for specialized work. " + "D" * 850,
+                    f"# {skill_id}",
+                )
+
+            runtime = SkillRuntime(skills_root)
+            result = runtime.retrieve("find a suitable skill")
+            catalog_text = json.dumps(
+                result["available_skills"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+            self.assertLessEqual(len(catalog_text), SKILL_CATALOG_MAX_CHARS)
+            self.assertEqual(result["available_skill_count"], 140)
+            self.assertEqual(
+                result["included_skill_count"] + result["omitted_skill_count"],
+                140,
+            )
+            self.assertLess(result["included_skill_count"], 140)
+            self.assertTrue(result["catalog_included"])
+            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
+
+            client = TestClient(create_app(skills_root))
+            discovery = client.post(
+                "/v1/skills/retrieve",
+                json={"query": "find a suitable skill"},
+            )
+            self.assertEqual(discovery.status_code, 200)
+            self.assertLess(len(discovery.text), 100_000)
+
+            selected = client.post(
+                "/v1/skills/retrieve",
+                json={
+                    "query": "use the selected skill",
+                    "hinted_skill_ids": ["skill000"],
+                },
+            )
+            self.assertEqual(selected.status_code, 200)
+            self.assertEqual(selected.json()["available_skills"], [])
+            self.assertFalse(selected.json()["catalog_included"])
+            self.assertLess(len(selected.text), 100_000)
+
+    def test_skill_entrypoint_hash_is_cached_for_catalog_and_retrieval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            _write_skill(skills_root, "alpha", "Use for alpha tasks.", "# Alpha")
+            runtime = SkillRuntime(skills_root)
+
+            with patch(
+                "skill_temple.runtime._content_hash",
+                side_effect=AssertionError("entrypoint hash should be cached"),
+            ):
+                catalog = runtime.resolve("no explicit selection")
+                selected = runtime.retrieve("$alpha do work")
+
+            self.assertTrue(catalog["available_skills"][0]["content_hash"])
+            self.assertEqual(selected["selected_skills"][0]["skill_id"], "alpha")
 
     def test_default_openapi_exposes_only_task_operations(self) -> None:
         schema = create_app().openapi()
@@ -496,8 +625,27 @@ class RuntimeTests(unittest.TestCase):
         available_schema = schema["components"]["schemas"]["AvailableSkillMetadata"]
         self.assertEqual(
             set(available_schema["properties"]),
-            {"skill_id", "name", "description", "entrypoint", "content_hash"},
+            {
+                "skill_id",
+                "name",
+                "description",
+                "description_truncated",
+                "entrypoint",
+                "content_hash",
+            },
         )
+        for field in [
+            "available_skill_count",
+            "included_skill_count",
+            "omitted_skill_count",
+            "descriptions_truncated",
+            "catalog_char_limit",
+            "catalog_included",
+            "explicit_skill_ids",
+            "unknown_skill_mentions",
+            "omitted_explicit_skill_ids",
+        ]:
+            self.assertIn(field, retrieve_response["properties"])
         read_response = schema["components"]["schemas"]["ReadSkillContentResponse"]
         self.assertIn("next_start_line", read_response["properties"])
 

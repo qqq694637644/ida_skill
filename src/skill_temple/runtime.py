@@ -8,6 +8,7 @@ the response budget; additional references are read explicitly by safe relative 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -38,9 +39,10 @@ _API_SYMBOL_RE = re.compile(
     r"|\b[A-Za-z_][A-Za-z0-9_]*\(\)"
 )
 
-DEFAULT_MAX_SKILLS = 1
+DEFAULT_MAX_SKILLS = 3
 DEFAULT_MANIFEST_MAX_CHARS = 24_000
 RETRIEVE_INSTRUCTIONS_MAX_CHARS = 60_000
+SKILL_CATALOG_MAX_CHARS = 20_000
 DOTENV_FILE_NAME = ".env"
 MAX_SKILL_SCAN_DEPTH = 6
 SKILL_NAME_MAX_CHARS = 64
@@ -68,6 +70,7 @@ class Skill:
     root: Path
     name: str
     description: str
+    content_hash: str
 
     @property
     def entrypoint(self) -> str:
@@ -160,6 +163,10 @@ def _unique_preserve_order(items: list[str]) -> list[str]:
 
 def _content_hash(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def _json_char_count(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
 
 
 def _explicit_skill_mentions(query: str) -> list[str]:
@@ -260,6 +267,7 @@ class SkillRuntime:
             root=manifest_path.parent.resolve(),
             name=name,
             description=description,
+            content_hash=_content_hash(manifest_path),
         )
 
     def list_skills(self) -> dict[str, Any]:
@@ -270,11 +278,67 @@ class SkillRuntime:
             "skills": [self._public_skill_metadata(skill) for skill in self._skills.values()],
         }
 
+    def _catalog_metadata(self, *, include_catalog: bool) -> dict[str, Any]:
+        total_count = len(self._skills)
+        if not include_catalog:
+            return {
+                "available_skills": [],
+                "available_skill_count": total_count,
+                "included_skill_count": 0,
+                "omitted_skill_count": total_count,
+                "descriptions_truncated": False,
+                "catalog_char_limit": SKILL_CATALOG_MAX_CHARS,
+                "catalog_included": False,
+            }
+
+        available_skills: list[dict[str, Any]] = []
+        descriptions_truncated = False
+        for skill in self._skills.values():
+            metadata = self._public_skill_metadata(skill)
+            if _json_char_count([*available_skills, metadata]) <= SKILL_CATALOG_MAX_CHARS:
+                available_skills.append(metadata)
+                continue
+
+            description = skill.description
+            low = 0
+            high = len(description)
+            best: dict[str, Any] | None = None
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = dict(metadata)
+                candidate["description"] = description[:middle].rstrip() + "..."
+                candidate["description_truncated"] = True
+                if (
+                    _json_char_count([*available_skills, candidate])
+                    <= SKILL_CATALOG_MAX_CHARS
+                ):
+                    best = candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
+
+            if best is not None:
+                available_skills.append(best)
+                descriptions_truncated = True
+            break
+
+        included_count = len(available_skills)
+        return {
+            "available_skills": available_skills,
+            "available_skill_count": total_count,
+            "included_skill_count": included_count,
+            "omitted_skill_count": total_count - included_count,
+            "descriptions_truncated": descriptions_truncated,
+            "catalog_char_limit": SKILL_CATALOG_MAX_CHARS,
+            "catalog_included": True,
+        }
+
     def resolve(
         self,
         query: str,
         hinted_skill_ids: list[str] | None = None,
         max_results: int = 3,
+        include_catalog: bool = True,
     ) -> dict[str, Any]:
         """Resolve only explicit hints or exact ``@/$skill`` mentions.
 
@@ -283,13 +347,18 @@ class SkillRuntime:
         judgment with server-side keyword scoring.
         """
 
-        hinted_skill_ids = hinted_skill_ids or []
+        hinted_skill_ids = _unique_preserve_order(hinted_skill_ids or [])
         for skill_id in hinted_skill_ids:
             self._get_skill(skill_id)
 
-        selected_ids = _unique_preserve_order(
-            [*hinted_skill_ids, *_explicit_skill_mentions(query)]
-        )
+        mentioned_skill_ids = _explicit_skill_mentions(query)
+        known_mentions = [
+            skill_id for skill_id in mentioned_skill_ids if skill_id in self._skills
+        ]
+        unknown_mentions = [
+            skill_id for skill_id in mentioned_skill_ids if skill_id not in self._skills
+        ]
+        selected_ids = _unique_preserve_order([*hinted_skill_ids, *known_mentions])
         matches: list[dict[str, Any]] = []
         for index, skill_id in enumerate(selected_ids):
             skill = self._skills.get(skill_id)
@@ -307,12 +376,13 @@ class SkillRuntime:
                 }
             )
 
-        return {
+        result = {
             "matches": matches[:max_results],
-            "available_skills": [
-                self._public_skill_metadata(skill) for skill in self._skills.values()
-            ],
+            "explicit_skill_ids": selected_ids,
+            "unknown_skill_mentions": unknown_mentions,
         }
+        result.update(self._catalog_metadata(include_catalog=include_catalog))
+        return result
 
     def retrieve(
         self,
@@ -322,15 +392,19 @@ class SkillRuntime:
         allow_skill_chaining: bool = False,
         include_debug: bool = False,
     ) -> dict[str, Any]:
-        """Select the minimal skill set and return each entrypoint within the budget."""
+        """Load explicit skills and return each entrypoint within the response budget."""
 
-        effective_max = min(3, max_skills if allow_skill_chaining else 1)
+        effective_max = min(DEFAULT_MAX_SKILLS, max(1, max_skills))
         resolved = self.resolve(
             query,
             hinted_skill_ids=hinted_skill_ids,
-            max_results=max(len(self._skills), effective_max),
+            max_results=max(len(self._skills), effective_max + 1),
+            include_catalog=False,
         )
-        selected_matches = resolved["matches"][:effective_max]
+        explicit_skill_ids = resolved["explicit_skill_ids"]
+        unknown_skill_mentions = resolved["unknown_skill_mentions"]
+        omitted_explicit_skill_ids = explicit_skill_ids[effective_max:]
+        selected_matches = [] if omitted_explicit_skill_ids else resolved["matches"]
         selected: list[dict[str, Any]] = []
         any_truncated = False
         remaining_instruction_chars = RETRIEVE_INSTRUCTIONS_MAX_CHARS
@@ -375,15 +449,33 @@ class SkillRuntime:
                 }
             selected.append(packet)
 
-        if not selected:
+        if omitted_explicit_skill_ids:
+            decision = {
+                "selected": False,
+                "next_action": "retryWithFewerSkills",
+                "reason": (
+                    f"{len(explicit_skill_ids)} skills were explicitly selected, but at most "
+                    f"{effective_max} can be loaded in one response. Retry with a smaller set."
+                ),
+                "stop_retrieval": False,
+            }
+        elif not selected:
             if self._skills:
+                if unknown_skill_mentions:
+                    reason = (
+                        "Explicitly mentioned skills are unavailable: "
+                        + ", ".join(unknown_skill_mentions)
+                        + ". Review available_skills, correct the name, or continue without it."
+                    )
+                else:
+                    reason = (
+                        "No explicit skill was selected. Review available_skills; retry once "
+                        "with exact hinted_skill_ids only when a description clearly matches."
+                    )
                 decision = {
                     "selected": False,
                     "next_action": "selectSkillOrAnswer",
-                    "reason": (
-                        "No explicit skill was selected. Review available_skills; retry once "
-                        "with exact hinted_skill_ids only when a description clearly matches."
-                    ),
+                    "reason": reason,
                     "stop_retrieval": False,
                 }
             else:
@@ -394,32 +486,46 @@ class SkillRuntime:
                     "stop_retrieval": True,
                 }
         elif any_truncated:
+            reason = "A selected SKILL.md was truncated; continue from next_start_line."
+            if unknown_skill_mentions:
+                reason += " Unavailable explicit mentions: " + ", ".join(
+                    unknown_skill_mentions
+                )
             decision = {
                 "selected": True,
                 "next_action": "readSkillContent",
-                "reason": "A selected SKILL.md was truncated; continue from next_start_line.",
+                "reason": reason,
                 "stop_retrieval": False,
             }
         else:
+            reason = (
+                "Read each returned SKILL.md completely, then read only the references "
+                "it directly identifies for this task."
+            )
+            if unknown_skill_mentions:
+                reason += " Unavailable explicit mentions: " + ", ".join(
+                    unknown_skill_mentions
+                )
             decision = {
                 "selected": True,
                 "next_action": "followSkillInstructions",
-                "reason": (
-                    "Read each returned SKILL.md completely, then read only the references "
-                    "it directly identifies for this task."
-                ),
+                "reason": reason,
                 "stop_retrieval": True,
             }
 
         result: dict[str, Any] = {
             "selected_skills": selected,
-            "available_skills": resolved["available_skills"],
+            "explicit_skill_ids": explicit_skill_ids,
+            "unknown_skill_mentions": unknown_skill_mentions,
+            "omitted_explicit_skill_ids": omitted_explicit_skill_ids,
             "decision": decision,
         }
+        result.update(self._catalog_metadata(include_catalog=not selected))
         if include_debug:
             result["debug"] = {
                 "available_skill_count": len(self._skills),
-                "allow_skill_chaining": allow_skill_chaining,
+                "allow_skill_chaining_requested": allow_skill_chaining,
+                "automatic_skill_chaining": len(selected_matches) > 1,
                 "instruction_char_limit": RETRIEVE_INSTRUCTIONS_MAX_CHARS,
                 "used_instruction_chars": used_instruction_chars,
                 "resolved_matches": resolved["matches"],
@@ -515,7 +621,11 @@ class SkillRuntime:
             "end_line": end,
             "total_lines": len(lines),
             "content": "\n".join(selected),
-            "content_hash": _content_hash(file_path),
+            "content_hash": (
+                skill.content_hash
+                if path == skill.entrypoint
+                else _content_hash(file_path)
+            ),
             "truncated": truncated,
             "next_start_line": next_start_line,
         }
@@ -801,6 +911,7 @@ class SkillRuntime:
             "skill_id": skill.skill_id,
             "name": skill.name,
             "description": skill.description,
+            "description_truncated": False,
             "entrypoint": skill.entrypoint,
-            "content_hash": _content_hash(skill.root / skill.entrypoint),
+            "content_hash": skill.content_hash,
         }

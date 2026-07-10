@@ -1,6 +1,11 @@
 # Skill Temple
 
-Skill Temple is a Codex-style `SKILL.md` runtime exposed as GPT Actions. It lets a Custom GPT discover a small set of local skills, load the selected skill instructions in full, and then progressively read only the referenced resources needed for the task.
+Skill Temple provides Codex-style model-driven skill selection adapted to GPT Actions.
+It lets a Custom GPT inspect a bounded catalog, select skills by stable handles, load the
+selected `SKILL.md` instructions, and progressively read only the referenced resources
+needed for the task. Unlike Codex's pre-turn context injection, this adapter uses a
+two-call Action flow because a Custom GPT cannot receive a dynamic server catalog in its
+static Instructions.
 
 The intended GPT-5.6 Sol flow is:
 
@@ -36,11 +41,11 @@ description: Use for IDAPython scripting, live IDA analysis, Hex-Rays, functions
 ---
 ```
 
-The frontmatter `name` is the stable `skill_id`; `name` and `description` are required.
-As in Codex, the model sees the available names and descriptions and decides whether a
-skill clearly applies. The server does not rank descriptions or expand aliases and
-keywords. Use a bilingual description when the Custom GPT serves Chinese and English
-users. No `skill.json` or separate index file is required.
+The frontmatter `name` becomes the stable `skill_id` selection handle; `name` and
+`description` are required. As in Codex, the model decides whether a description clearly
+applies. The server does not rank descriptions or expand aliases and keywords. Use a
+bilingual description when the Custom GPT serves Chinese and English users. No
+`skill.json` or separate index file is required.
 
 The body of `SKILL.md` should:
 
@@ -75,9 +80,23 @@ All public operations publish `x-openai-isConsequential: false` for this trusted
 
 ### Select a skill
 
-Without an explicit hint, the first call returns `available_skills` only. The model
-reviews each `name` and `description`. If exactly one description clearly matches, it
-retries once with the exact `skill_id`:
+Without an explicit selection, the first call returns a bounded `available_skills`
+catalog. Each item contains a `skill_id` selection handle plus name, description,
+entrypoint metadata, and a cached content hash. The catalog uses a 20,000-character
+budget and reports:
+
+```text
+available_skill_count
+included_skill_count
+omitted_skill_count
+descriptions_truncated
+catalog_char_limit
+catalog_included
+```
+
+If descriptions were shortened or entries were omitted, the model must not interpret
+the visible list as the complete installed set. If exactly one visible description
+clearly matches, it retries once with the exact `skill_id`:
 
 ```json
 {
@@ -87,8 +106,14 @@ retries once with the exact `skill_id`:
 }
 ```
 
-Exact `@idapython` and `$idapython` mentions are also accepted. The runtime does not
-silently select a skill from fuzzy keyword overlap.
+Codex-style `$idapython` mentions are accepted. The gateway additionally supports
+`@idapython` as a convenience extension. Unknown explicit mentions are returned in
+`unknown_skill_mentions`; they are never treated like an ordinary unselected task. The
+runtime does not silently select a skill from fuzzy keyword overlap.
+
+After one or more skills are loaded, the response omits the repeated catalog by default
+and returns `catalog_included=false`. This keeps the selected Skill instructions and the
+Action response within the platform boundary.
 
 A selected skill packet contains:
 
@@ -139,9 +164,14 @@ Use search only when the selected `SKILL.md` does not identify an exact relevant
 
 ## Multiple skills
 
-Set `allow_skill_chaining=true` only when the model explicitly selects multiple domains.
-The runtime loads up to three exact hinted or explicitly mentioned skills with `primary`
-and `secondary` roles.
+Multiple exact hints or explicit mentions automatically load together; callers do not
+need to remember `allow_skill_chaining=true`. The field remains accepted for backward
+compatibility. Up to three explicitly selected skills are loaded with `primary` and
+`secondary` roles.
+
+If more than three skills are explicitly selected, the runtime loads none of them and
+returns `next_action=retryWithFewerSkills`, the full `explicit_skill_ids`, and
+`omitted_explicit_skill_ids`. It never partially executes a larger explicit selection.
 
 Skill entrypoints share a 60,000-character response budget. A single selected
 `SKILL.md` receives at most 24,000 characters; multi-skill responses divide the

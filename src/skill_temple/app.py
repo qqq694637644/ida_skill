@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .ida_actions import register_ida_actions
 from .runtime import (
+    DEFAULT_MAX_SKILLS,
     SkillNotFoundError,
     SkillPathError,
     env_value_from_environment_or_dotenv,
@@ -44,8 +45,7 @@ class ResolveSkillRequest(StrictRequest):
     hinted_skill_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional explicit skill hints, for example ['idapython'] "
-            "when user writes @idapython."
+            "Explicit skill selection handles, for example ['idapython']."
         ),
     )
     max_results: int = Field(default=3, ge=1, le=10)
@@ -56,13 +56,15 @@ class RetrieveSkillContextRequest(StrictRequest):
     hinted_skill_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional explicit skill hints, for example ['idapython'] "
-            "when user writes @idapython."
+            "Explicit skill selection handles chosen from available_skills."
         ),
     )
     allow_skill_chaining: bool = Field(
         default=False,
-        description="Load multiple explicitly selected skills instead of only the first.",
+        description=(
+            "Backward-compatible hint. Multiple explicit selections are always loaded "
+            "together when within the response limit."
+        ),
     )
 
 
@@ -118,9 +120,10 @@ class SelectedSkillPacket(BaseModel):
 
 
 class AvailableSkillMetadata(BaseModel):
-    skill_id: str
+    skill_id: str = Field(..., description="Selection handle used in hinted_skill_ids.")
     name: str
     description: str
+    description_truncated: bool = False
     entrypoint: str
     content_hash: str
 
@@ -131,6 +134,7 @@ class Decision(BaseModel):
         "followSkillInstructions",
         "readSkillContent",
         "selectSkillOrAnswer",
+        "retryWithFewerSkills",
         "answerWithoutSkill",
     ]
     reason: str
@@ -140,6 +144,15 @@ class Decision(BaseModel):
 class RetrieveSkillContextResponse(BaseModel):
     selected_skills: list[SelectedSkillPacket] = Field(default_factory=list)
     available_skills: list[AvailableSkillMetadata] = Field(default_factory=list)
+    available_skill_count: int
+    included_skill_count: int
+    omitted_skill_count: int
+    descriptions_truncated: bool
+    catalog_char_limit: int
+    catalog_included: bool
+    explicit_skill_ids: list[str] = Field(default_factory=list)
+    unknown_skill_mentions: list[str] = Field(default_factory=list)
+    omitted_explicit_skill_ids: list[str] = Field(default_factory=list)
     decision: Decision
 
 
@@ -262,9 +275,9 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         title="Skill Temple Gateway",
         version="0.1.0",
         description=(
-            "A Codex-style SKILL.md runtime for Custom GPT Actions. It exposes skill "
-            "name and description for model selection, loads explicitly selected skills, "
-            "and supports progressive disclosure through safe resource reads."
+            "Codex-style model-driven skill selection adapted to Custom GPT Actions. "
+            "The model chooses from a bounded catalog, then the gateway loads explicit "
+            "SKILL.md entrypoints and supports progressive disclosure."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
@@ -320,7 +333,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         return runtime.retrieve(
             query=request.query,
             hinted_skill_ids=request.hinted_skill_ids,
-            max_skills=3 if request.allow_skill_chaining else 1,
+            max_skills=DEFAULT_MAX_SKILLS,
             allow_skill_chaining=request.allow_skill_chaining,
             include_debug=include_debug,
         )
@@ -359,7 +372,8 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         operation_id="resolveSkill",
         summary="Resolve exact skill hints or mentions.",
         description=(
-            "Diagnostic endpoint for exact hinted_skill_ids and @/$ skill mentions. "
+            "Diagnostic endpoint for exact hinted_skill_ids, Codex-style $skill mentions, "
+            "and the gateway's @skill extension. "
             "It does not perform semantic description ranking."
         ),
         include_in_schema=False,
@@ -391,8 +405,8 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Discover or load explicitly selected skills.",
         description=(
-            "Return the skill catalog, and load SKILL.md instructions for exact hints or "
-            "explicit @/$ skill mentions."
+            "Return a bounded skill catalog, or load exact hinted skills and explicit "
+            "$skill mentions. @skill is also supported as a gateway extension."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
