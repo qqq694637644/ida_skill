@@ -161,6 +161,13 @@ The Custom GPT calls only the FastAPI/OpenAPI surface. It does not call the MCP 
 
 For current IDB facts, use live IDA Actions rather than documentation or assumptions. `executeIdapython` is available for custom analysis, bulk processing, renaming, comments, patches, type changes, and validation. The GPT Action adapter accepts `timeout_seconds` from 1 to 35 seconds so the plugin timeout plus its 5-second response margin remains within the Action round trip. Inspect `status`, `stdout`, `stderr`, `result`, and `error` before reporting success. Keep mutations within the user's requested scope and perform a targeted read-back when the execution response alone does not prove the change.
 
+IDA Action responses are capped at 80,000 serialized JSON characters. Function and
+xref lists are reduced to a fitting page and return `truncated` plus `next_offset`.
+The xref adapter supports offsets inside its 5,000-item window. Decompile responses
+report `pseudocode_truncated` and `disassembly_truncated`; execution responses report
+`stdout_truncated`, `stderr_truncated`, `result_truncated`, and `error_truncated` when
+the corresponding field is shortened.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and replace the placeholders:

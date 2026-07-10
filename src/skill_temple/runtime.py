@@ -1,8 +1,8 @@
 """Codex-style skill discovery and progressive disclosure for GPT Actions.
 
 A skill is defined by one required ``SKILL.md`` file. Discovery exposes only its
-frontmatter name and description. After selection, the complete ``SKILL.md`` is
-returned; additional references are read explicitly by safe relative path.
+frontmatter name and description. After selection, its entrypoint is returned within
+the response budget; additional references are read explicitly by safe relative path.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_@*.-]+")
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -40,7 +40,40 @@ DEFAULT_MANIFEST_MAX_CHARS = 24_000
 RETRIEVE_INSTRUCTIONS_MAX_CHARS = 60_000
 DOTENV_FILE_NAME = ".env"
 MAX_SKILL_SCAN_DEPTH = 6
+SKILL_NAME_MAX_CHARS = 64
+SKILL_DESCRIPTION_MAX_CHARS = 1024
 _TEXT_REFERENCE_SUFFIXES = {".md", ".rst", ".txt"}
+_DISCOVERY_STOPWORDS = {
+    "a",
+    "an",
+    "analysis",
+    "and",
+    "as",
+    "at",
+    "be",
+    "by",
+    "configuration",
+    "for",
+    "from",
+    "help",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "please",
+    "request",
+    "task",
+    "the",
+    "this",
+    "to",
+    "tool",
+    "use",
+    "using",
+    "with",
+    "work",
+}
 
 
 class SkillRuntimeError(RuntimeError):
@@ -245,6 +278,16 @@ class SkillRuntime:
             raise SkillRuntimeError(f"SKILL.md is missing frontmatter name: {manifest_path}")
         if not description:
             raise SkillRuntimeError(f"SKILL.md is missing frontmatter description: {manifest_path}")
+        if len(name) > SKILL_NAME_MAX_CHARS:
+            raise SkillRuntimeError(
+                f"SKILL.md frontmatter name exceeds {SKILL_NAME_MAX_CHARS} characters: "
+                f"{manifest_path}"
+            )
+        if len(description) > SKILL_DESCRIPTION_MAX_CHARS:
+            raise SkillRuntimeError(
+                "SKILL.md frontmatter description exceeds "
+                f"{SKILL_DESCRIPTION_MAX_CHARS} characters: {manifest_path}"
+            )
         skill_id = _safe_skill_id(name)
         return Skill(
             skill_id=skill_id,
@@ -292,10 +335,13 @@ class SkillRuntime:
                     reasons.append(f"matched skill name {alias!r}")
 
             discovery_tokens = set(_tokens(f"{skill.name} {skill.description}"))
-            overlap = query_tokens & discovery_tokens
+            overlap = (query_tokens & discovery_tokens) - _DISCOVERY_STOPWORDS
             if overlap:
-                score += min(20.0, len(overlap) * 2.0)
-                reasons.append("name/description token overlap")
+                score += min(20.0, len(overlap) * 4.0)
+                reasons.append(
+                    "meaningful name/description token overlap: "
+                    + ", ".join(sorted(overlap))
+                )
 
             if score <= 0:
                 continue
@@ -323,7 +369,7 @@ class SkillRuntime:
         allow_skill_chaining: bool = False,
         include_debug: bool = False,
     ) -> dict[str, Any]:
-        """Select the minimal skill set and return every selected SKILL.md in full."""
+        """Select the minimal skill set and return each entrypoint within the budget."""
 
         effective_max = min(3, max_skills if allow_skill_chaining else 1)
         resolved = self.resolve(

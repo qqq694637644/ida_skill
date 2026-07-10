@@ -14,6 +14,8 @@ from skill_temple.evals import evaluate_file
 from skill_temple.runtime import (
     DEFAULT_MANIFEST_MAX_CHARS,
     RETRIEVE_INSTRUCTIONS_MAX_CHARS,
+    SKILL_DESCRIPTION_MAX_CHARS,
+    SKILL_NAME_MAX_CHARS,
     SkillPathError,
     SkillRuntime,
     SkillRuntimeError,
@@ -81,6 +83,23 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.resolve("validate this configuration")["matches"], [])
             explicit = runtime.resolve("use @ida for this database")
             self.assertEqual(explicit["matches"][0]["skill_id"], "ida")
+
+    def test_resolve_ignores_generic_description_words(self) -> None:
+        runtime = load_runtime()
+
+        for query in [
+            "please use this tool",
+            "use this configuration",
+            "analysis request",
+        ]:
+            with self.subTest(query=query):
+                self.assertEqual(runtime.resolve(query)["matches"], [])
+
+        for query in ["find xrefs in IDA", "Hex-Rays decompile"]:
+            with self.subTest(query=query):
+                result = runtime.resolve(query)
+                self.assertTrue(result["matches"])
+                self.assertEqual(result["matches"][0]["skill_id"], "idapython")
 
     def test_retrieve_returns_complete_skill_entrypoint(self) -> None:
         runtime = load_runtime()
@@ -270,6 +289,29 @@ class RuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(SkillRuntimeError, "missing frontmatter description"):
+                SkillRuntime(skills_root)
+
+    def test_frontmatter_name_and_description_lengths_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            _write_skill(
+                skills_root,
+                "n" * (SKILL_NAME_MAX_CHARS + 1),
+                "Use for long-name tests.",
+                "# Long name",
+            )
+            with self.assertRaisesRegex(SkillRuntimeError, "name exceeds"):
+                SkillRuntime(skills_root)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            _write_skill(
+                skills_root,
+                "long-description",
+                "D" * (SKILL_DESCRIPTION_MAX_CHARS + 1),
+                "# Long description",
+            )
+            with self.assertRaisesRegex(SkillRuntimeError, "description exceeds"):
                 SkillRuntime(skills_root)
 
     def test_multiple_skills_require_explicit_chaining(self) -> None:

@@ -9,6 +9,7 @@ The route handlers are synchronous because the reused IDA transport uses
 from __future__ import annotations
 
 import importlib
+import json
 import time
 from types import ModuleType
 from typing import Any, Literal
@@ -23,6 +24,13 @@ IDA_ERROR_HINT = (
 )
 PLUGIN_RESPONSE_TIMEOUT_MARGIN_SECONDS = 5
 GPT_ACTION_EXECUTION_TIMEOUT_MAX_SECONDS = 35
+IDA_ACTION_RESPONSE_MAX_CHARS = 80_000
+XREF_ADAPTER_MAX_ITEMS = 5_000
+DECOMPILE_PSEUDOCODE_MAX_CHARS = 50_000
+EXECUTE_STDOUT_MAX_CHARS = 16_000
+EXECUTE_STDERR_MAX_CHARS = 16_000
+EXECUTE_RESULT_MAX_JSON_CHARS = 28_000
+EXECUTE_ERROR_MAX_JSON_CHARS = 8_000
 
 
 class StrictIdaRequest(BaseModel):
@@ -51,8 +59,13 @@ class GetIdaDatabaseInfoRequest(IdaTargetRequest):
 
 
 class ListIdaFunctionsRequest(IdaTargetRequest):
-    offset: int = Field(default=0, ge=0)
-    limit: int = Field(default=200, ge=1, le=5000)
+    offset: int = Field(default=0, ge=0, description="Function offset for pagination.")
+    limit: int = Field(
+        default=200,
+        ge=1,
+        le=5000,
+        description="Requested function count; the adapter may return fewer with next_offset.",
+    )
     name_contains: str | None = None
     segment: str | None = None
     include_thunks: bool = False
@@ -75,11 +88,29 @@ class GetIdaXrefsRequest(IdaTargetRequest):
     name: str | None = None
     direction: Literal["to", "from"] = "to"
     xref_kind: Literal["all", "code", "data"] = "all"
-    limit: int = Field(default=200, ge=1, le=5000)
+    offset: int = Field(
+        default=0,
+        ge=0,
+        le=XREF_ADAPTER_MAX_ITEMS - 1,
+        description="Cross-reference offset within the adapter's 5000-item window.",
+    )
+    limit: int = Field(
+        default=200,
+        ge=1,
+        le=5000,
+        description=(
+            "Requested xref count; offset + limit must be at most 5000, and the adapter "
+            "may return fewer with next_offset."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_target(self) -> GetIdaXrefsRequest:
         _require_exactly_one_target(self.address, self.name, "getIdaXrefs")
+        if self.offset + self.limit > XREF_ADAPTER_MAX_ITEMS:
+            raise ValueError(
+                f"getIdaXrefs requires offset + limit <= {XREF_ADAPTER_MAX_ITEMS}"
+            )
         return self
 
 
@@ -111,6 +142,197 @@ def _require_exactly_one_target(address: str | None, name: str | None, operation
     has_name = name is not None and bool(name.strip())
     if has_address == has_name:
         raise ValueError(f"{operation} requires exactly one of address or name")
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _json_char_count(value: Any) -> int:
+    return len(_json_text(value))
+
+
+def _truncate_string_field(
+    payload: dict[str, Any],
+    key: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, str) or len(value) <= max_chars:
+        return payload
+    result = dict(payload)
+    result[key] = value[:max_chars]
+    result[f"{key}_truncated"] = True
+    result[f"{key}_original_chars"] = len(value)
+    result["response_truncated"] = True
+    result["response_char_limit"] = IDA_ACTION_RESPONSE_MAX_CHARS
+    return result
+
+
+def _truncate_json_field(
+    payload: dict[str, Any],
+    key: str,
+    max_json_chars: int,
+) -> dict[str, Any]:
+    if key not in payload:
+        return payload
+    value = payload[key]
+    serialized = _json_text(value)
+    if len(serialized) <= max_json_chars:
+        return payload
+    result = dict(payload)
+    result[key] = serialized[:max_json_chars]
+    result[f"{key}_truncated"] = True
+    result[f"{key}_original_json_chars"] = len(serialized)
+    result[f"{key}_original_type"] = type(value).__name__
+    result[f"{key}_encoding"] = "truncated_json_preview"
+    result["response_truncated"] = True
+    result["response_char_limit"] = IDA_ACTION_RESPONSE_MAX_CHARS
+    return result
+
+
+def _hard_cap_response(payload: dict[str, Any]) -> dict[str, Any]:
+    if _json_char_count(payload) <= IDA_ACTION_RESPONSE_MAX_CHARS:
+        return payload
+
+    compact: dict[str, Any] = {
+        "response_truncated": True,
+        "response_char_limit": IDA_ACTION_RESPONSE_MAX_CHARS,
+        "truncation_reason": "Serialized IDA Action response exceeded the adapter limit.",
+    }
+    for key in ("status", "instance_id", "port", "found", "name", "address"):
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if isinstance(value, (bool, int, float)) or value is None:
+            compact[key] = value
+        elif isinstance(value, str) and len(value) <= 512:
+            compact[key] = value
+
+    preview = _json_text(payload)
+    compact["response_preview_original_chars"] = len(preview)
+    low = 0
+    high = len(preview)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = dict(compact)
+        candidate["response_preview"] = preview[:middle]
+        if _json_char_count(candidate) <= IDA_ACTION_RESPONSE_MAX_CHARS:
+            low = middle
+        else:
+            high = middle - 1
+    compact["response_preview"] = preview[:low]
+    return compact
+
+
+def _budget_list_response(
+    payload: dict[str, Any],
+    *,
+    list_key: str,
+    offset: int,
+    source_has_more: bool | None = None,
+    max_next_offset: int | None = None,
+) -> dict[str, Any]:
+    items = payload.get(list_key)
+    if not isinstance(items, list):
+        return _hard_cap_response(payload)
+
+    original_items = list(items)
+    if source_has_more is None:
+        source_has_more = bool(payload.get("truncated")) or payload.get("next_offset") is not None
+
+    def build(count: int) -> dict[str, Any]:
+        result = dict(payload)
+        result[list_key] = original_items[:count]
+        result["returned"] = count
+        adapter_truncated = count < len(original_items)
+        truncated = bool(source_has_more) or adapter_truncated
+        result["truncated"] = truncated
+        if truncated:
+            candidate_next_offset = offset + count
+            if max_next_offset is not None and candidate_next_offset >= max_next_offset:
+                result["next_offset"] = None
+                result["more_available"] = True
+                result["truncation_hint"] = (
+                    "The adapter pagination window is exhausted; use executeIdapython "
+                    "for a custom narrower query."
+                )
+            else:
+                result["next_offset"] = candidate_next_offset
+        else:
+            result["next_offset"] = None
+        if adapter_truncated:
+            result["response_truncated"] = True
+            result["response_char_limit"] = IDA_ACTION_RESPONSE_MAX_CHARS
+        else:
+            result.pop("response_truncated", None)
+            result.pop("response_char_limit", None)
+        return result
+
+    full = build(len(original_items))
+    if _json_char_count(full) <= IDA_ACTION_RESPONSE_MAX_CHARS:
+        return full
+
+    low = 0
+    high = len(original_items)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _json_char_count(build(middle)) <= IDA_ACTION_RESPONSE_MAX_CHARS:
+            low = middle
+        else:
+            high = middle - 1
+
+    result = build(low)
+    if low == 0 and original_items:
+        preview = _json_text(original_items[0])
+        result["oversized_item_omitted"] = True
+        result["oversized_item_preview"] = preview[:8_000]
+        result["oversized_item_original_chars"] = len(preview)
+        candidate_next_offset = offset + 1
+        if max_next_offset is None or candidate_next_offset < max_next_offset:
+            result["next_offset"] = candidate_next_offset
+    return _hard_cap_response(result)
+
+
+def _budget_decompile_response(payload: dict[str, Any]) -> dict[str, Any]:
+    result = _truncate_string_field(
+        dict(payload),
+        "pseudocode",
+        DECOMPILE_PSEUDOCODE_MAX_CHARS,
+    )
+    disassembly = result.get("disassembly")
+    if isinstance(disassembly, list) and _json_char_count(result) > IDA_ACTION_RESPONSE_MAX_CHARS:
+        source_truncated = bool(result.get("disassembly_truncated"))
+
+        def build(count: int) -> dict[str, Any]:
+            candidate = dict(result)
+            candidate["disassembly"] = disassembly[:count]
+            candidate["disassembly_returned"] = count
+            adapter_truncated = count < len(disassembly)
+            candidate["disassembly_truncated"] = source_truncated or adapter_truncated
+            if adapter_truncated:
+                candidate["response_truncated"] = True
+                candidate["response_char_limit"] = IDA_ACTION_RESPONSE_MAX_CHARS
+            return candidate
+
+        low = 0
+        high = len(disassembly)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _json_char_count(build(middle)) <= IDA_ACTION_RESPONSE_MAX_CHARS:
+                low = middle
+            else:
+                high = middle - 1
+        result = build(low)
+    return _hard_cap_response(result)
+
+
+def _budget_execute_response(payload: dict[str, Any]) -> dict[str, Any]:
+    result = _truncate_string_field(dict(payload), "stdout", EXECUTE_STDOUT_MAX_CHARS)
+    result = _truncate_string_field(result, "stderr", EXECUTE_STDERR_MAX_CHARS)
+    result = _truncate_json_field(result, "result", EXECUTE_RESULT_MAX_JSON_CHARS)
+    result = _truncate_json_field(result, "error", EXECUTE_ERROR_MAX_JSON_CHARS)
+    return _hard_cap_response(result)
 
 
 def _load_ida_server_module() -> ModuleType | None:
@@ -262,7 +484,12 @@ def register_ida_actions(app: FastAPI) -> None:
             "include_thunks": request.include_thunks,
             "include_library_functions": request.include_library_functions,
         }
-        return _request_plugin(server, request, "/functions", method="POST", data=payload)
+        result = _request_plugin(server, request, "/functions", method="POST", data=payload)
+        return _budget_list_response(
+            result,
+            list_key="functions",
+            offset=request.offset,
+        )
 
     @app.post(
         "/v1/ida/decompile",
@@ -283,7 +510,8 @@ def register_ida_actions(app: FastAPI) -> None:
             "name": request.name,
             "include_disassembly": request.include_disassembly,
         }
-        return _request_plugin(server, request, "/decompile", method="POST", data=payload)
+        result = _request_plugin(server, request, "/decompile", method="POST", data=payload)
+        return _budget_decompile_response(result)
 
     @app.post(
         "/v1/ida/xrefs",
@@ -299,14 +527,38 @@ def register_ida_actions(app: FastAPI) -> None:
         server = _load_ida_server_module()
         if server is None:
             return _setup_error()
+        fetch_limit = request.offset + request.limit
         payload = {
             "address": request.address,
             "name": request.name,
             "direction": request.direction,
             "xref_kind": request.xref_kind,
-            "limit": request.limit,
+            "limit": fetch_limit,
         }
-        return _request_plugin(server, request, "/xrefs", method="POST", data=payload)
+        result = _request_plugin(server, request, "/xrefs", method="POST", data=payload)
+        xrefs = result.get("xrefs")
+        if not isinstance(xrefs, list):
+            return _hard_cap_response(result)
+
+        page_end = request.offset + request.limit
+        page = xrefs[request.offset:page_end]
+        source_has_more = len(xrefs) > page_end or bool(result.get("truncated"))
+        result = dict(result)
+        result["xrefs"] = page
+        query = result.get("query")
+        if isinstance(query, dict):
+            query = dict(query)
+            query["offset"] = request.offset
+            query["limit"] = request.limit
+            result["query"] = query
+        result["offset"] = request.offset
+        return _budget_list_response(
+            result,
+            list_key="xrefs",
+            offset=request.offset,
+            source_has_more=source_has_more,
+            max_next_offset=XREF_ADAPTER_MAX_ITEMS,
+        )
 
     @app.post(
         "/v1/ida/execute",
@@ -345,12 +597,12 @@ def register_ida_actions(app: FastAPI) -> None:
             )
             result.setdefault("instance_id", resolved_instance_id)
             result.setdefault("port", port)
-            return result
+            return _budget_execute_response(result)
         except Exception as exc:
             timeout_class = getattr(server, "IdaPluginResponseTimeout", None)
             timeout_type = getattr(timeout_class, "__name__", "")
             if type(exc).__name__ in {timeout_type, "IdaPluginResponseTimeout"}:
-                return {
+                return _budget_execute_response({
                     "status": "plugin_response_timeout",
                     "result": None,
                     "stdout": "",
@@ -367,5 +619,7 @@ def register_ida_actions(app: FastAPI) -> None:
                     "timeout_seconds": request.timeout_seconds,
                     "instance_id": resolved_instance_id,
                     "port": port,
-                }
-            return _tool_error(str(exc), instance_id=resolved_instance_id, port=port)
+                })
+            return _budget_execute_response(
+                _tool_error(str(exc), instance_id=resolved_instance_id, port=port)
+            )

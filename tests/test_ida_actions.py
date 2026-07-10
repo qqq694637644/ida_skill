@@ -93,6 +93,87 @@ class FakeIdaServer:
         raise AssertionError(f"unexpected endpoint {endpoint}")
 
 
+class LargeResponseIdaServer(FakeIdaServer):
+    def make_ida_request(
+        self,
+        endpoint: str,
+        *,
+        method: str = "GET",
+        data: dict[str, object] | None = None,
+        port: int | None = None,
+        timeout: float = 60.0,
+    ) -> dict[str, object]:
+        data = data or {}
+        self.requests.append(
+            {
+                "endpoint": endpoint,
+                "method": method,
+                "data": data,
+                "port": port,
+                "timeout": timeout,
+            }
+        )
+        if endpoint == "/functions":
+            count = int(data.get("limit", 5000))
+            offset = int(data.get("offset", 0))
+            return {
+                "offset": offset,
+                "limit": count,
+                "total": 5000,
+                "returned": count,
+                "next_offset": None,
+                "truncated": False,
+                "functions": [
+                    {
+                        "name": f"function_{index:05d}_" + "N" * 80,
+                        "ea": 0x401000 + index * 16,
+                        "segment": ".text",
+                    }
+                    for index in range(count)
+                ],
+            }
+        if endpoint == "/xrefs":
+            count = int(data.get("limit", 5000))
+            return {
+                "returned": count,
+                "truncated": count >= 5000,
+                "xrefs": [
+                    {
+                        "index": index,
+                        "from_name": f"caller_{index:05d}",
+                        "to_name": "target",
+                        "source_disassembly": "mov eax, " + "D" * 120,
+                    }
+                    for index in range(count)
+                ],
+            }
+        if endpoint == "/decompile":
+            return {
+                "name": str(data.get("name") or "large"),
+                "pseudocode": "P" * 120_000,
+                "disassembly": [
+                    {"ea": 0x401000 + index, "text": "D" * 200}
+                    for index in range(2000)
+                ],
+                "disassembly_truncated": False,
+            }
+        if endpoint == "/execute":
+            return {
+                "status": "ok",
+                "stdout": "O" * 120_000,
+                "stderr": "E" * 120_000,
+                "result": {"items": ["R" * 200 for _ in range(1000)]},
+                "error": None,
+            }
+        return super().make_ida_request(
+            endpoint,
+            method=method,
+            data=data,
+            port=port,
+            timeout=timeout,
+        )
+
+
 def test_ida_action_endpoints_call_ida_server(monkeypatch) -> None:
     fake_server = FakeIdaServer()
     monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
@@ -179,6 +260,84 @@ def test_execute_idapython_timeout_is_bounded_for_gpt_actions(monkeypatch) -> No
     )
     assert accepted.status_code == 200
     assert fake_server.requests[-1]["timeout"] == 40.0
+
+
+def test_large_ida_action_responses_are_bounded(monkeypatch) -> None:
+    fake_server = LargeResponseIdaServer()
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
+    client = TestClient(create_app())
+
+    functions = client.post("/v1/ida/functions", json={"limit": 5000})
+    assert functions.status_code == 200
+    assert len(functions.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    functions_body = functions.json()
+    assert functions_body["truncated"] is True
+    assert functions_body["response_truncated"] is True
+    assert functions_body["next_offset"] == functions_body["returned"]
+
+    xrefs = client.post(
+        "/v1/ida/xrefs",
+        json={"name": "target", "offset": 0, "limit": 5000},
+    )
+    assert xrefs.status_code == 200
+    assert len(xrefs.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    xrefs_body = xrefs.json()
+    assert xrefs_body["truncated"] is True
+    assert xrefs_body["response_truncated"] is True
+    assert xrefs_body["next_offset"] == xrefs_body["returned"]
+
+    decompile = client.post(
+        "/v1/ida/decompile",
+        json={"name": "large", "include_disassembly": True},
+    )
+    assert decompile.status_code == 200
+    assert len(decompile.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    decompile_body = decompile.json()
+    assert decompile_body["pseudocode_truncated"] is True
+    assert decompile_body["disassembly_truncated"] is True
+
+    execute = client.post("/v1/ida/execute", json={"code": "result = large()"})
+    assert execute.status_code == 200
+    assert len(execute.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    execute_body = execute.json()
+    assert execute_body["response_truncated"] is True
+    assert execute_body["stdout_truncated"] is True
+    assert execute_body["stderr_truncated"] is True
+    assert execute_body["result_truncated"] is True
+
+
+def test_hard_response_fallback_stays_within_the_limit() -> None:
+    payload = {"status": "ok", "metadata": "M" * 300_000}
+
+    bounded = ida_actions._hard_cap_response(payload)
+
+    assert ida_actions._json_char_count(bounded) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    assert bounded["response_truncated"] is True
+    assert bounded["response_preview_original_chars"] > ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+
+
+def test_xrefs_adapter_supports_bounded_offset_pagination(monkeypatch) -> None:
+    fake_server = LargeResponseIdaServer()
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
+    client = TestClient(create_app())
+
+    page = client.post(
+        "/v1/ida/xrefs",
+        json={"name": "target", "offset": 100, "limit": 25},
+    )
+
+    assert page.status_code == 200
+    body = page.json()
+    assert body["offset"] == 100
+    assert body["returned"] == 25
+    assert body["xrefs"][0]["index"] == 100
+    assert fake_server.requests[-1]["data"]["limit"] == 125
+
+    invalid = client.post(
+        "/v1/ida/xrefs",
+        json={"name": "target", "offset": 4999, "limit": 2},
+    )
+    assert invalid.status_code == 422
 
 
 def test_decompile_and_xrefs_require_one_target(monkeypatch) -> None:
