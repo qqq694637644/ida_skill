@@ -99,7 +99,7 @@ SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-sc
 
 That directory contains the `idapython/` skill folder and avoids pointing Skill Temple at the full submodule root, which also contains non-skill folders such as `src/` and `tests/`.
 
-The pinned submodule commit includes formal `idapython/skill.json` metadata and `INDEX.md` upstream in `ida-script-mcp-main`, so Skill Temple does not need fallback-only metadata and does not need to copy the docs tree into `ida_skill`.
+The pinned submodule commit provides a Codex-style `idapython/SKILL.md` entrypoint and its referenced docs. Skill Temple reads `name` and `description` from frontmatter, returns the selected `SKILL.md` in full, and leaves task-specific docs for progressive disclosure.
 
 ## Public reverse proxy layout
 
@@ -155,9 +155,9 @@ Keep the existing skill operations:
 
 | Operation ID | Method | Path | Purpose |
 | --- | --- | --- | --- |
-| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Retrieve relevant skill rules and docs. |
-| `searchSkillDocs` | `POST` | `/v1/skills/search` | Search inside skill docs. |
-| `readSkillContent` | `POST` | `/v1/skills/read` | Read a safe relative skill file path. |
+| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Select skills and return each complete `SKILL.md`. |
+| `searchSkillDocs` | `POST` | `/v1/skills/search` | Fallback search for a reference path inside one skill. |
+| `readSkillContent` | `POST` | `/v1/skills/read` | Read an exact safe relative path named by `SKILL.md`. |
 
 Add IDA operations:
 
@@ -319,7 +319,7 @@ Later, add typed response models only for fields GPT frequently needs, such as:
    external/ida-script-mcp-main/src/ida_script_mcp/resources
    ```
 4. Confirm Skill Temple can load `idapython` from the submodule resources.
-5. Keep the submodule pinned to a commit that contains upstream `idapython/skill.json` and `INDEX.md` resources.
+5. Keep the submodule pinned to a commit where `idapython/SKILL.md` is the only entrypoint and directly routes to task-specific docs.
 
 ### Phase 2: IDA Action router
 
@@ -392,10 +392,12 @@ For an IDA task, the Custom GPT can call tools in this order:
 
 ```text
 1. retrieveSkillContext(query, hinted_skill_ids=["idapython"])
-2. listIdaInstances({})
-3. getIdaDatabaseInfo({instance_id})
-4. listIdaFunctions / decompileIdaFunction / getIdaXrefs
-5. executeIdapython when direct IDAPython is useful
+2. Read the returned SKILL.md completely
+3. readSkillContent(skill_id, exact_path) for only the required references
+4. searchSkillDocs only when SKILL.md gives no exact path
+5. listIdaInstances / getIdaDatabaseInfo when live target identity matters
+6. listIdaFunctions / decompileIdaFunction / getIdaXrefs
+7. executeIdapython when custom IDAPython is useful
 ```
 
 Because this is personal-use automation, all operations are marked non-consequential in OpenAPI, including `executeIdapython`.
@@ -410,7 +412,7 @@ Because this is personal-use automation, all operations are marked non-consequen
 | GPT Action import rejects schema. | Keep descriptions <= 300 chars and every operation has `x-openai-isConsequential: false`. |
 | Caddy prefix mismatch. | Set `SKILL_TEMPLE_SERVER_URL=https://gptaction.casacam.net/skills`; keep FastAPI internal paths unprefixed. |
 | Full submodule root is not a valid skills directory. | Use `external/ida-script-mcp-main/src/ida_script_mcp/resources` as `SKILL_TEMPLE_SKILLS_DIR`. |
-| `idapython` metadata goes missing upstream. | Keep the submodule pinned to a commit that includes `skill.json` and `INDEX.md`. |
+| `idapython/SKILL.md` or a directly referenced doc goes missing upstream. | Pin the submodule to a tested commit and validate every referenced relative path. |
 | Blocking IDA plugin calls freeze the event loop. | Use sync FastAPI handlers or `anyio.to_thread.run_sync`; do not directly await blocking wrappers. |
 | Gateway and IDA run on different machines. | `IDA_SCRIPT_MCP_HOST=127.0.0.1` only works when both run on the same host; otherwise use a private reachable host. |
 
@@ -421,7 +423,7 @@ The integration is ready when:
 1. `git submodule update --init --recursive` restores `external/ida-script-mcp-main`.
 2. `py -3 -m pip install -e external/ida-script-mcp-main` makes `ida_script_mcp` importable.
 3. `skill-temple` loads `idapython` from the submodule resources.
-4. `idapython` has formal metadata through upstream `skill.json`, not only fallback metadata.
+4. `idapython` loads from `SKILL.md` frontmatter without `skill.json` or `INDEX.md`.
 5. `/openapi.json` imports into Custom GPT Actions without schema errors.
 6. All public operations publish `x-openai-isConsequential: false`, including `executeIdapython`.
 7. `/v1/ida/instances` works without IDA by returning a useful empty/no-instance message.

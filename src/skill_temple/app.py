@@ -60,17 +60,16 @@ class RetrieveSkillContextRequest(StrictRequest):
             "when user writes @idapython."
         ),
     )
-    max_docs: int = Field(default=6, ge=1, le=20)
     allow_skill_chaining: bool = Field(
         default=False,
-        description="Allow multiple cooperating skills in one retrieval result.",
+        description="Return multiple matching skills when the task clearly needs them.",
     )
 
 
 class ConsoleRetrieveRequest(RetrieveSkillContextRequest):
     include_debug: bool = Field(
         default=False,
-        description="Return diagnostic fields such as manifest summaries and raw retrieved docs.",
+        description="Return hidden routing diagnostics for the development console.",
     )
 
 
@@ -91,7 +90,7 @@ class ReadSkillContentRequest(StrictRequest):
         description="Safe relative path inside the skill, for example docs/ida_hexrays.md.",
     )
     start_line: int = Field(default=1, ge=1)
-    max_lines: int = Field(default=200, ge=1, le=2000)
+    max_lines: int = Field(default=2000, ge=1, le=5000)
 
 
 class ErrorDetail(BaseModel):
@@ -104,55 +103,35 @@ class StructuredErrorResponse(BaseModel):
     error: ErrorDetail
 
 
-class EvidenceItem(BaseModel):
-    path: str
-    section: str | None = None
-    why_relevant: str
-
-
-class ResponseContract(BaseModel):
-    expected_output: str
-    must_include: list[str]
-    preferred_modules_or_topics: list[str] = Field(default_factory=list)
-    must_avoid: list[str] = Field(default_factory=list)
-
-
-class ValidationGuidance(BaseModel):
-    can_validate: bool
-    suggested_checks: list[str] = Field(default_factory=list)
-    failure_behavior: list[str] = Field(default_factory=list)
-
-
 class SelectedSkillPacket(BaseModel):
     skill_id: str
+    name: str
+    description: str
     role: Literal["primary", "secondary"]
     confidence: float
-    capability_tags: list[str] = Field(default_factory=list)
-    operating_rules: list[str] = Field(default_factory=list)
-    response_contract: ResponseContract
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    validation_guidance: ValidationGuidance
-
-
-class RetrievalBudget(BaseModel):
-    max_docs: int
-    max_chars: int
-    used_docs: int
+    source_path: str
+    instructions: str
+    content_hash: str
+    total_lines: int
     truncated: bool
+    next_start_line: int | None = None
+    referenced_paths: list[str] = Field(default_factory=list)
 
 
 class Decision(BaseModel):
-    ready: bool
-    next_action: Literal["answer", "searchSkillDocs"]
+    selected: bool
+    next_action: Literal[
+        "followSkillInstructions",
+        "readSkillContent",
+        "answerWithoutSkill",
+    ]
     reason: str
-    stop: bool
+    stop_retrieval: bool
 
 
 class RetrieveSkillContextResponse(BaseModel):
     selected_skills: list[SelectedSkillPacket] = Field(default_factory=list)
-    retrieval_budget: RetrievalBudget
     decision: Decision
-    fallback_queries: list[str] | None = None
 
 
 class SearchMatch(BaseModel):
@@ -179,6 +158,7 @@ class SearchSkillDocsResponse(BaseModel):
     mode: str
     engine: str
     matches: list[SearchMatch] = Field(default_factory=list)
+    recommended_next_action: Literal["readSkillContent", "none"]
 
 
 class ReadSkillContentResponse(BaseModel):
@@ -190,6 +170,7 @@ class ReadSkillContentResponse(BaseModel):
     content: str
     content_hash: str
     truncated: bool
+    next_start_line: int | None = None
 
 
 def _normalize_server_url(server_url: str | None) -> str | None:
@@ -272,9 +253,9 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         title="Skill Temple Gateway",
         version="0.1.0",
         description=(
-            "A local Skill Runtime gateway for Custom GPT Actions. It retrieves compact "
-            "skill manifest rules and relevant documentation snippets without requiring "
-            "Custom GPT Knowledge to unpack or index skill archives."
+            "A Codex-style SKILL.md runtime for Custom GPT Actions. It selects matching "
+            "skills, returns each selected SKILL.md in full, and supports progressive "
+            "disclosure through safe resource reads."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
@@ -331,7 +312,6 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             query=request.query,
             hinted_skill_ids=request.hinted_skill_ids,
             max_skills=3 if request.allow_skill_chaining else 1,
-            max_docs=request.max_docs,
             allow_skill_chaining=request.allow_skill_chaining,
             include_debug=include_debug,
         )
@@ -401,13 +381,12 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         response_model_exclude_none=True,
         responses={404: {"model": StructuredErrorResponse}},
         summary=(
-            "Retrieve the best matching skill rules and relevant documentation "
-            "for a user task."
+            "Select matching skills and return each SKILL.md in full."
         ),
         description=(
-            "Default first Action call for skill-backed tasks, including hints such as "
-            "@idapython. Selects relevant skills, returns compact rules and documentation "
-            "snippets, and reports whether follow-up search or file reads are needed."
+            "Default first Action call for skill-backed tasks. Read every returned SKILL.md "
+            "completely, then follow its instructions and read only the referenced resources "
+            "needed for the task."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -427,8 +406,8 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Search documentation for a specific skill.",
         description=(
-            "Use after retrieveSkillContext when more specific documentation is needed, "
-            "or when the user asks about exact APIs, constants, classes, or edge behavior."
+            "Fallback search inside one selected skill when SKILL.md does not identify an "
+            "exact resource path. Prefer readSkillContent for paths named by SKILL.md."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -459,8 +438,8 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Read a skill file by safe relative path.",
         description=(
-            "Use for precise follow-up reads when retrieveSkillContext or searchSkillDocs "
-            "identifies a specific file path. Paths are constrained to the selected skill root."
+            "Read a resource explicitly referenced by a selected SKILL.md. Continue with "
+            "start_line until the selected resource has been read completely."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -537,8 +516,6 @@ CONSOLE_HTML = """<!doctype html>
   <textarea id="query">@idapython write a script to find xrefs to strcpy</textarea>
   <label for="hints">Hinted skill ids, comma-separated</label>
   <input id="hints" type="text" value="idapython" />
-  <label for="max_docs">Max docs</label>
-  <input id="max_docs" type="number" min="1" max="20" value="6" />
   <div class="row">
     <label><input id="allow_chain" type="checkbox" /> Allow skill chaining</label>
     <label><input id="include_debug" type="checkbox" checked /> Include debug</label>
@@ -582,7 +559,6 @@ CONSOLE_HTML = """<!doctype html>
         body: {
           query: '@idapython write a script to find xrefs to strcpy',
           hinted_skill_ids: ['idapython'],
-          max_docs: 6,
           allow_skill_chaining: false
         }
       },
@@ -755,7 +731,6 @@ CONSOLE_HTML = """<!doctype html>
       const body = {
         query: document.getElementById('query').value,
         hinted_skill_ids: hinted,
-        max_docs: Number(document.getElementById('max_docs').value || 6),
         allow_skill_chaining: document.getElementById('allow_chain').checked,
         include_debug: document.getElementById('include_debug').checked
       };
