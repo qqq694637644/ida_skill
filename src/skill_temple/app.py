@@ -495,7 +495,7 @@ CONSOLE_HTML = """<!doctype html>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 980px; }
     label { display: block; font-weight: 600; margin-top: 1rem; }
-    input[type="text"], input[type="number"], textarea {
+    input[type="password"], input[type="text"], input[type="number"], select, textarea {
       width: 100%; box-sizing: border-box; padding: .55rem; font: inherit;
     }
     textarea { min-height: 7rem; }
@@ -503,6 +503,10 @@ CONSOLE_HTML = """<!doctype html>
     pre { background: #111827; color: #e5e7eb; padding: 1rem; overflow: auto; }
     .row { display: flex; gap: 1rem; align-items: center; }
     .row label { font-weight: 400; margin-top: .75rem; }
+    .actions { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+    .muted { color: #6b7280; }
+    .panel { border-top: 1px solid #e5e7eb; margin-top: 1.5rem; padding-top: 1rem; }
+    #api_log { min-height: 12rem; white-space: pre-wrap; }
   </style>
 </head>
 <body>
@@ -511,6 +515,24 @@ CONSOLE_HTML = """<!doctype html>
     This development console is hidden from the GPT Action OpenAPI schema
     and may request debug output.
   </p>
+
+  <section class="panel">
+    <h2>Bearer Token</h2>
+    <p class="muted">
+      Optional. Stored only in this browser tab session and redacted in the trace log.
+    </p>
+    <label for="bearer_token">Authorization token</label>
+    <input id="bearer_token" type="password" autocomplete="off"
+      placeholder="Bearer token from .env" />
+    <div class="actions">
+      <button id="save_token" type="button">Save token to sessionStorage</button>
+      <button id="clear_token" type="button">Clear token</button>
+      <span id="token_state" class="muted">No token saved.</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Quick retrieveSkillContext debug call</h2>
   <label for="query">Query</label>
   <textarea id="query">@idapython write a script to find xrefs to strcpy</textarea>
   <label for="hints">Hinted skill ids, comma-separated</label>
@@ -522,10 +544,211 @@ CONSOLE_HTML = """<!doctype html>
     <label><input id="include_debug" type="checkbox" checked /> Include debug</label>
   </div>
   <button id="run">Retrieve</button>
+  </section>
+
+  <section class="panel">
+    <h2>Manual GPT Action call</h2>
+    <label for="operation">Operation</label>
+    <select id="operation"></select>
+    <label for="operation_body">JSON body</label>
+    <textarea id="operation_body"></textarea>
+    <button id="run_operation" type="button">Run Operation</button>
+  </section>
+
   <h2>Result</h2>
   <pre id="result">Ready.</pre>
+
+  <section class="panel">
+    <div class="actions">
+      <h2>API Call Timeline</h2>
+      <button id="clear_log" type="button">Clear Timeline</button>
+    </div>
+    <pre id="api_log">Ready.</pre>
+  </section>
+
   <script>
     const result = document.getElementById('result');
+    const apiLog = document.getElementById('api_log');
+    const tokenInput = document.getElementById('bearer_token');
+    const tokenState = document.getElementById('token_state');
+    const operationSelect = document.getElementById('operation');
+    const operationBody = document.getElementById('operation_body');
+    const TOKEN_KEY = 'skill_temple_console_bearer_token';
+
+    const operations = {
+      retrieveSkillContext: {
+        method: 'POST',
+        url: '/v1/skills/retrieve',
+        body: {
+          query: '@idapython write a script to find xrefs to strcpy',
+          hinted_skill_ids: ['idapython'],
+          max_docs: 6,
+          allow_skill_chaining: false
+        }
+      },
+      searchSkillDocs: {
+        method: 'POST',
+        url: '/v1/skills/search',
+        body: {skill_id: 'idapython', query: 'ctree_visitor_t cot_call', limit: 5}
+      },
+      readSkillContent: {
+        method: 'POST',
+        url: '/v1/skills/read',
+        body: {skill_id: 'idapython', path: 'SKILL.md', start_line: 1, max_lines: 80}
+      },
+      listIdaInstances: {method: 'POST', url: '/v1/ida/instances', body: {}},
+      getIdaDatabaseInfo: {method: 'POST', url: '/v1/ida/database-info', body: {}},
+      listIdaFunctions: {
+        method: 'POST',
+        url: '/v1/ida/functions',
+        body: {offset: 0, limit: 50}
+      },
+      decompileIdaFunction: {
+        method: 'POST',
+        url: '/v1/ida/decompile',
+        body: {name: 'main', include_disassembly: false}
+      },
+      getIdaXrefs: {
+        method: 'POST',
+        url: '/v1/ida/xrefs',
+        body: {name: 'main', direction: 'to', xref_kind: 'all', limit: 100}
+      },
+      executeIdapython: {
+        method: 'POST',
+        url: '/v1/ida/execute',
+        body: {
+          code: 'import idaapi\nresult = {"imagebase": hex(idaapi.get_imagebase())}',
+          capture_output: true,
+          timeout_seconds: 30
+        }
+      }
+    };
+
+    for (const name of Object.keys(operations)) {
+      const option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      operationSelect.appendChild(option);
+    }
+
+    function updateOperationBody() {
+      const operation = operations[operationSelect.value];
+      operationBody.value = JSON.stringify(operation.body, null, 2);
+    }
+
+    function setTokenState() {
+      tokenState.textContent = sessionStorage.getItem(TOKEN_KEY)
+        ? 'Token saved.'
+        : 'No token saved.';
+    }
+
+    function nowStamp() {
+      const now = new Date();
+      return now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
+    }
+
+    function appendLog(title, payload) {
+      if (apiLog.textContent === 'Ready.') {
+        apiLog.textContent = '';
+      }
+      const rendered = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+      apiLog.textContent += `[${nowStamp()}] ${title}\n${rendered}\n\n`;
+      apiLog.scrollTop = apiLog.scrollHeight;
+    }
+
+    function getHeaders() {
+      const token = sessionStorage.getItem(TOKEN_KEY);
+      const headers = {'Content-Type': 'application/json'};
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      return headers;
+    }
+
+    function redactHeaders(headers) {
+      const redacted = {...headers};
+      if (redacted.Authorization) {
+        redacted.Authorization = 'Bearer ***redacted***';
+      }
+      return redacted;
+    }
+
+    async function apiCall({label, method, url, body}) {
+      const headers = getHeaders();
+      const started = performance.now();
+      appendLog(`${label}: request start`, {method, url, headers: redactHeaders(headers), body});
+      result.textContent = 'Loading...';
+      try {
+        appendLog(`${label}: waiting response`, 'fetch() in progress...');
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: JSON.stringify(body)
+        });
+        const durationMs = Math.round(performance.now() - started);
+        const responseHeaders = Object.fromEntries(response.headers.entries());
+        const contentType = response.headers.get('content-type') || '';
+        appendLog(`${label}: response received`, {
+          status: response.status,
+          statusText: response.statusText,
+          contentType,
+          durationMs
+        });
+        appendLog(`${label}: response headers`, responseHeaders);
+        const text = await response.text();
+        try {
+          const data = text ? JSON.parse(text) : null;
+          appendLog(`${label}: parsed json`, data);
+          result.textContent = JSON.stringify(data, null, 2);
+          return data;
+        } catch (parseError) {
+          const diagnostic = {
+            error: String(parseError),
+            status: response.status,
+            contentType,
+            rawText: text
+          };
+          appendLog(`${label}: non-json response`, diagnostic);
+          result.textContent = JSON.stringify(diagnostic, null, 2);
+          return diagnostic;
+        }
+      } catch (error) {
+        const durationMs = Math.round(performance.now() - started);
+        const diagnostic = {error: String(error), durationMs};
+        appendLog(`${label}: request failed`, diagnostic);
+        result.textContent = JSON.stringify(diagnostic, null, 2);
+        return diagnostic;
+      }
+    }
+
+    tokenInput.value = sessionStorage.getItem(TOKEN_KEY) || '';
+    setTokenState();
+    updateOperationBody();
+
+    document.getElementById('save_token').addEventListener('click', () => {
+      const token = tokenInput.value.trim();
+      if (token) {
+        sessionStorage.setItem(TOKEN_KEY, token);
+      } else {
+        sessionStorage.removeItem(TOKEN_KEY);
+      }
+      setTokenState();
+      appendLog('Bearer token updated', {Authorization: token ? 'Bearer ***redacted***' : null});
+    });
+
+    document.getElementById('clear_token').addEventListener('click', () => {
+      tokenInput.value = '';
+      sessionStorage.removeItem(TOKEN_KEY);
+      setTokenState();
+      appendLog('Bearer token cleared', {Authorization: null});
+    });
+
+    document.getElementById('clear_log').addEventListener('click', () => {
+      apiLog.textContent = 'Ready.';
+    });
+
+    operationSelect.addEventListener('change', updateOperationBody);
+
     document.getElementById('run').addEventListener('click', async () => {
       const hinted = document.getElementById('hints').value
         .split(',').map(v => v.trim()).filter(Boolean);
@@ -536,17 +759,28 @@ CONSOLE_HTML = """<!doctype html>
         allow_skill_chaining: document.getElementById('allow_chain').checked,
         include_debug: document.getElementById('include_debug').checked
       };
-      result.textContent = 'Loading...';
+      await apiCall({
+        label: 'consoleRetrieve',
+        method: 'POST',
+        url: '/console/retrieve',
+        body
+      });
+    });
+
+    document.getElementById('run_operation').addEventListener('click', async () => {
+      const operation = operations[operationSelect.value];
       try {
-        const response = await fetch('/console/retrieve', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(body)
+        const body = JSON.parse(operationBody.value || '{}');
+        await apiCall({
+          label: operationSelect.value,
+          method: operation.method,
+          url: operation.url,
+          body
         });
-        const data = await response.json();
-        result.textContent = JSON.stringify(data, null, 2);
       } catch (error) {
-        result.textContent = String(error);
+        const diagnostic = {error: String(error), rawText: operationBody.value};
+        appendLog(`${operationSelect.value}: invalid request JSON`, diagnostic);
+        result.textContent = JSON.stringify(diagnostic, null, 2);
       }
     });
   </script>

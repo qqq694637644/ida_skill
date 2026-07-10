@@ -327,6 +327,14 @@ class RuntimeTests(unittest.TestCase):
         html_response = client.get("/console")
         self.assertEqual(html_response.status_code, 200)
         self.assertIn("Skill Temple Console", html_response.text)
+        self.assertIn("API Call Timeline", html_response.text)
+        self.assertIn("Bearer Token", html_response.text)
+        self.assertIn("apiCall", html_response.text)
+        self.assertIn("sessionStorage", html_response.text)
+        self.assertIn("Authorization", html_response.text)
+        self.assertIn("***redacted***", html_response.text)
+        self.assertIn("executeIdapython", html_response.text)
+        self.assertNotIn("fetch('/console/retrieve'", html_response.text)
 
         debug_response = client.post(
             "/console/retrieve",
