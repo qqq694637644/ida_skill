@@ -62,7 +62,7 @@ class RetrieveSkillContextRequest(StrictRequest):
     )
     allow_skill_chaining: bool = Field(
         default=False,
-        description="Return multiple matching skills when the task clearly needs them.",
+        description="Load multiple explicitly selected skills instead of only the first.",
     )
 
 
@@ -117,11 +117,20 @@ class SelectedSkillPacket(BaseModel):
     referenced_paths: list[str] = Field(default_factory=list)
 
 
+class AvailableSkillMetadata(BaseModel):
+    skill_id: str
+    name: str
+    description: str
+    entrypoint: str
+    content_hash: str
+
+
 class Decision(BaseModel):
     selected: bool
     next_action: Literal[
         "followSkillInstructions",
         "readSkillContent",
+        "selectSkillOrAnswer",
         "answerWithoutSkill",
     ]
     reason: str
@@ -130,6 +139,7 @@ class Decision(BaseModel):
 
 class RetrieveSkillContextResponse(BaseModel):
     selected_skills: list[SelectedSkillPacket] = Field(default_factory=list)
+    available_skills: list[AvailableSkillMetadata] = Field(default_factory=list)
     decision: Decision
 
 
@@ -252,9 +262,9 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         title="Skill Temple Gateway",
         version="0.1.0",
         description=(
-            "A Codex-style SKILL.md runtime for Custom GPT Actions. It selects matching "
-            "skills, returns each selected SKILL.md in full, and supports progressive "
-            "disclosure through safe resource reads."
+            "A Codex-style SKILL.md runtime for Custom GPT Actions. It exposes skill "
+            "name and description for model selection, loads explicitly selected skills, "
+            "and supports progressive disclosure through safe resource reads."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
@@ -347,10 +357,10 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
     @app.post(
         "/v1/skills/resolve",
         operation_id="resolveSkill",
-        summary="Resolve which skill best matches a user task.",
+        summary="Resolve exact skill hints or mentions.",
         description=(
-            "Ranks available skills for a task. This is useful for diagnostics; "
-            "retrieveSkillContext already performs resolution internally."
+            "Diagnostic endpoint for exact hinted_skill_ids and @/$ skill mentions. "
+            "It does not perform semantic description ranking."
         ),
         include_in_schema=False,
     )
@@ -379,9 +389,10 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         response_model=RetrieveSkillContextResponse,
         response_model_exclude_none=True,
         responses={404: {"model": StructuredErrorResponse}},
-        summary="Select matching skills and return SKILL.md instructions.",
+        summary="Discover or load explicitly selected skills.",
         description=(
-            "Select matching skills and return their SKILL.md instructions."
+            "Return the skill catalog, and load SKILL.md instructions for exact hints or "
+            "explicit @/$ skill mentions."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )

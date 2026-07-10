@@ -65,14 +65,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("instructions", skill)
         self.assertNotIn("docs", skill)
 
-    def test_resolve_uses_hint_name_and_description(self) -> None:
+    def test_resolve_uses_exact_mentions_and_explicit_hints(self) -> None:
         runtime = load_runtime()
-        result = runtime.resolve("@idapython write a Hex-Rays ctree visitor")
+        at_mention = runtime.resolve("@idapython write a Hex-Rays ctree visitor")
+        dollar_mention = runtime.resolve("use $idapython for this task")
+        hinted = runtime.resolve("反编译 main 函数", hinted_skill_ids=["idapython"])
 
-        self.assertTrue(result["matches"])
-        self.assertEqual(result["matches"][0]["skill_id"], "idapython")
-        self.assertGreater(result["matches"][0]["confidence"], 0.5)
-        self.assertIn("description", result["matches"][0])
+        for result in [at_mention, dollar_mention, hinted]:
+            self.assertEqual(result["matches"][0]["skill_id"], "idapython")
+            self.assertIn("description", result["matches"][0])
+            self.assertNotIn("confidence", result["matches"][0])
+            self.assertEqual(result["available_skills"][0]["skill_id"], "idapython")
 
     def test_resolve_does_not_match_skill_name_inside_another_word(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -84,7 +87,7 @@ class RuntimeTests(unittest.TestCase):
             explicit = runtime.resolve("use @ida for this database")
             self.assertEqual(explicit["matches"][0]["skill_id"], "ida")
 
-    def test_resolve_ignores_generic_description_words(self) -> None:
+    def test_resolve_does_not_make_server_side_semantic_selection(self) -> None:
         runtime = load_runtime()
 
         for query in [
@@ -94,24 +97,28 @@ class RuntimeTests(unittest.TestCase):
             "请使用这个工具",
             "请帮我处理这个请求",
             "分析这个配置",
-        ]:
-            with self.subTest(query=query):
-                self.assertEqual(runtime.resolve(query)["matches"], [])
-
-        for query in [
             "find xrefs in IDA",
             "Hex-Rays decompile",
             "反编译 main 函数",
             "查找 strcpy 的交叉引用",
             "用 IDAPython 批量重命名函数",
             "给地址打补丁",
+            "函数求导怎么做",
+            "解释 Python 函数类型注解",
+            "把这个文件重命名",
+            "给软件安装安全补丁",
+            "我的家庭地址是什么",
+            "解释大端和小端字节序",
+            "编译这个 Rust 项目",
+            "做一次交叉验证",
+            "分析数据库类型设计",
         ]:
             with self.subTest(query=query):
                 result = runtime.resolve(query)
-                self.assertTrue(result["matches"])
-                self.assertEqual(result["matches"][0]["skill_id"], "idapython")
+                self.assertEqual(result["matches"], [])
+                self.assertEqual(result["available_skills"][0]["skill_id"], "idapython")
 
-    def test_multilingual_discovery_metadata_accepts_lists_and_strings(self) -> None:
+    def test_non_codex_frontmatter_fields_do_not_trigger_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_root = skills_root / "demo"
@@ -130,14 +137,10 @@ class RuntimeTests(unittest.TestCase):
 
             runtime = SkillRuntime(skills_root)
 
-            self.assertEqual(
-                runtime.resolve("请执行中文发现")["matches"][0]["skill_id"],
-                "demo",
-            )
-            self.assertEqual(
-                runtime.resolve("使用演示工具")["matches"][0]["skill_id"],
-                "demo",
-            )
+            self.assertEqual(runtime.resolve("请执行中文发现")["matches"], [])
+            self.assertEqual(runtime.resolve("使用演示工具")["matches"], [])
+            selected = runtime.resolve("中文任务", hinted_skill_ids=["demo"])
+            self.assertEqual(selected["matches"][0]["skill_id"], "demo")
 
     def test_retrieve_returns_complete_skill_entrypoint(self) -> None:
         runtime = load_runtime()
@@ -422,7 +425,7 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
 
-    def test_retrieve_returns_no_skill_for_unmatched_task(self) -> None:
+    def test_retrieve_returns_catalog_before_model_selects_a_skill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             _write_skill(
@@ -436,7 +439,15 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(result["selected_skills"], [])
             self.assertFalse(result["decision"]["selected"])
-            self.assertEqual(result["decision"]["next_action"], "answerWithoutSkill")
+            self.assertEqual(result["decision"]["next_action"], "selectSkillOrAnswer")
+            self.assertFalse(result["decision"]["stop_retrieval"])
+            self.assertEqual(result["available_skills"][0]["skill_id"], "alpha")
+
+            selected = runtime.retrieve(
+                "unrelated cooking recipe",
+                hinted_skill_ids=["alpha"],
+            )
+            self.assertEqual(selected["selected_skills"][0]["skill_id"], "alpha")
 
     def test_default_openapi_exposes_only_task_operations(self) -> None:
         schema = create_app().openapi()
@@ -480,6 +491,13 @@ class RuntimeTests(unittest.TestCase):
             "next_start_line",
         ]:
             self.assertIn(field, selected_schema["properties"])
+        retrieve_response = schema["components"]["schemas"]["RetrieveSkillContextResponse"]
+        self.assertIn("available_skills", retrieve_response["properties"])
+        available_schema = schema["components"]["schemas"]["AvailableSkillMetadata"]
+        self.assertEqual(
+            set(available_schema["properties"]),
+            {"skill_id", "name", "description", "entrypoint", "content_hash"},
+        )
         read_response = schema["components"]["schemas"]["ReadSkillContentResponse"]
         self.assertIn("next_start_line", read_response["properties"])
 
@@ -521,10 +539,23 @@ class RuntimeTests(unittest.TestCase):
 
     def test_http_endpoints_follow_progressive_disclosure(self) -> None:
         client = TestClient(create_app())
+        discovery = client.post(
+            "/v1/skills/retrieve",
+            json={"query": "反编译 main 函数"},
+        )
+        self.assertEqual(discovery.status_code, 200)
+        discovery_body = discovery.json()
+        self.assertEqual(discovery_body["selected_skills"], [])
+        self.assertEqual(
+            discovery_body["decision"]["next_action"],
+            "selectSkillOrAnswer",
+        )
+        self.assertIn("中文", discovery_body["available_skills"][0]["description"])
+
         retrieve = client.post(
             "/v1/skills/retrieve",
             json={
-                "query": "@idapython write a script to find xrefs to strcpy",
+                "query": "反编译 main 函数",
                 "hinted_skill_ids": ["idapython"],
             },
         )

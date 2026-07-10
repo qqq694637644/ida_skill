@@ -22,6 +22,9 @@ import yaml
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_@*.-]+")
+_EXPLICIT_SKILL_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[@$]([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?![A-Za-z0-9_-])"
+)
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
@@ -43,50 +46,6 @@ MAX_SKILL_SCAN_DEPTH = 6
 SKILL_NAME_MAX_CHARS = 64
 SKILL_DESCRIPTION_MAX_CHARS = 1024
 _TEXT_REFERENCE_SUFFIXES = {".md", ".rst", ".txt"}
-SKILL_ALIASES_MAX_ITEMS = 32
-SKILL_KEYWORDS_MAX_ITEMS = 64
-SKILL_DISCOVERY_TERM_MAX_CHARS = 64
-_CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
-_DISCOVERY_STOPWORDS = {
-    "a",
-    "an",
-    "analysis",
-    "and",
-    "as",
-    "at",
-    "be",
-    "by",
-    "configuration",
-    "for",
-    "from",
-    "help",
-    "in",
-    "is",
-    "it",
-    "of",
-    "on",
-    "or",
-    "please",
-    "request",
-    "task",
-    "the",
-    "this",
-    "to",
-    "tool",
-    "use",
-    "using",
-    "with",
-    "work",
-    "分析",
-    "使用",
-    "任务",
-    "请求",
-    "工具",
-    "帮助",
-    "配置",
-    "这个",
-    "进行",
-}
 
 
 class SkillRuntimeError(RuntimeError):
@@ -109,25 +68,10 @@ class Skill:
     root: Path
     name: str
     description: str
-    discovery_aliases: tuple[str, ...] = ()
-    keywords: tuple[str, ...] = ()
 
     @property
     def entrypoint(self) -> str:
         return "SKILL.md"
-
-    @property
-    def aliases(self) -> list[str]:
-        return _unique_preserve_order(
-            [f"@{self.skill_id}", self.skill_id, self.name, *self.discovery_aliases]
-        )
-
-    @property
-    def discovery_text(self) -> str:
-        return " ".join(
-            [self.name, self.description, *self.discovery_aliases, *self.keywords]
-        )
-
 
 def load_runtime(skills_dir: str | Path | None = None) -> SkillRuntime:
     """Create a runtime from an explicit path, environment, cwd, or packaged examples."""
@@ -204,19 +148,6 @@ def _tokens(text: str) -> list[str]:
     return [token.lower() for token in _TOKEN_RE.findall(text)]
 
 
-def _discovery_tokens(text: str) -> set[str]:
-    tokens = set(_tokens(text))
-    for run in _CJK_RUN_RE.findall(text):
-        normalized = run.casefold()
-        tokens.add(normalized)
-        for size in range(2, min(4, len(normalized)) + 1):
-            tokens.update(
-                normalized[index : index + size]
-                for index in range(0, len(normalized) - size + 1)
-            )
-    return tokens
-
-
 def _unique_preserve_order(items: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -231,11 +162,10 @@ def _content_hash(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
 
-def _alias_matches(alias: str, query_lower: str) -> bool:
-    if not alias:
-        return False
-    boundary_pattern = rf"(?<![A-Za-z0-9_]){re.escape(alias.lower())}(?![A-Za-z0-9_])"
-    return re.search(boundary_pattern, query_lower) is not None
+def _explicit_skill_mentions(query: str) -> list[str]:
+    return _unique_preserve_order(
+        [match.group(1) for match in _EXPLICIT_SKILL_MENTION_RE.finditer(query)]
+    )
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -260,45 +190,6 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     data = {str(key): value for key, value in parsed.items()}
     body = "\n".join(lines[closing + 1 :])
     return data, body
-
-
-def _frontmatter_string_list(
-    frontmatter: dict[str, Any],
-    key: str,
-    *,
-    max_items: int,
-) -> tuple[str, ...]:
-    raw_value = frontmatter.get(key)
-    if raw_value is None:
-        return ()
-    if isinstance(raw_value, str):
-        values = [raw_value]
-    elif isinstance(raw_value, list):
-        values = raw_value
-    else:
-        raise SkillRuntimeError(f"SKILL.md frontmatter {key} must be a string or list")
-
-    if len(values) > max_items:
-        raise SkillRuntimeError(
-            f"SKILL.md frontmatter {key} exceeds {max_items} items"
-        )
-
-    normalized: list[str] = []
-    for value in values:
-        if not isinstance(value, str):
-            raise SkillRuntimeError(
-                f"SKILL.md frontmatter {key} entries must be strings"
-            )
-        term = value.strip()
-        if not term:
-            continue
-        if len(term) > SKILL_DISCOVERY_TERM_MAX_CHARS:
-            raise SkillRuntimeError(
-                f"SKILL.md frontmatter {key} entry exceeds "
-                f"{SKILL_DISCOVERY_TERM_MAX_CHARS} characters"
-            )
-        normalized.append(term)
-    return tuple(_unique_preserve_order(normalized))
 
 
 class SkillRuntime:
@@ -363,24 +254,12 @@ class SkillRuntime:
                 "SKILL.md frontmatter description exceeds "
                 f"{SKILL_DESCRIPTION_MAX_CHARS} characters: {manifest_path}"
             )
-        aliases = _frontmatter_string_list(
-            frontmatter,
-            "aliases",
-            max_items=SKILL_ALIASES_MAX_ITEMS,
-        )
-        keywords = _frontmatter_string_list(
-            frontmatter,
-            "keywords",
-            max_items=SKILL_KEYWORDS_MAX_ITEMS,
-        )
         skill_id = _safe_skill_id(name)
         return Skill(
             skill_id=skill_id,
             root=manifest_path.parent.resolve(),
             name=name,
             description=description,
-            discovery_aliases=aliases,
-            keywords=keywords,
         )
 
     def list_skills(self) -> dict[str, Any]:
@@ -397,56 +276,43 @@ class SkillRuntime:
         hinted_skill_ids: list[str] | None = None,
         max_results: int = 3,
     ) -> dict[str, Any]:
-        """Rank skills using explicit hints plus frontmatter name and description."""
+        """Resolve only explicit hints or exact ``@/$skill`` mentions.
+
+        Codex exposes the skill catalog to the model and lets the model decide whether a
+        description clearly matches the task. The runtime does not reproduce that semantic
+        judgment with server-side keyword scoring.
+        """
 
         hinted_skill_ids = hinted_skill_ids or []
         for skill_id in hinted_skill_ids:
             self._get_skill(skill_id)
 
-        hint_order = {skill_id: index for index, skill_id in enumerate(hinted_skill_ids)}
-        query_lower = query.lower()
-        query_tokens = _discovery_tokens(query)
+        selected_ids = _unique_preserve_order(
+            [*hinted_skill_ids, *_explicit_skill_mentions(query)]
+        )
         matches: list[dict[str, Any]] = []
-
-        for skill in self._skills.values():
-            score = 0.0
-            reasons: list[str] = []
-            if skill.skill_id in hint_order:
-                score += 100.0 - hint_order[skill.skill_id]
-                reasons.append("explicit skill hint")
-
-            for alias in skill.aliases:
-                alias_lower = alias.lower()
-                if _alias_matches(alias_lower, query_lower):
-                    score += 25.0 if alias.startswith("@") else 12.0
-                    reasons.append(f"matched skill name {alias!r}")
-
-            discovery_tokens = _discovery_tokens(skill.discovery_text)
-            overlap = (query_tokens & discovery_tokens) - _DISCOVERY_STOPWORDS
-            if overlap:
-                score += min(20.0, len(overlap) * 4.0)
-                reasons.append(
-                    "meaningful name/description token overlap: "
-                    + ", ".join(sorted(overlap))
-                )
-
-            if score <= 0:
+        for index, skill_id in enumerate(selected_ids):
+            skill = self._skills.get(skill_id)
+            if skill is None:
                 continue
-            confidence = min(0.99, score / 30.0)
+            hinted = skill_id in hinted_skill_ids
             matches.append(
                 {
                     "skill_id": skill.skill_id,
                     "name": skill.name,
                     "description": skill.description,
-                    "confidence": round(confidence, 3),
-                    "score": round(score, 3),
-                    "reason": "; ".join(_unique_preserve_order(reasons)),
+                    "selection_order": index,
+                    "reason": "explicit skill hint" if hinted else "exact @/$ skill mention",
                     "recommended_next_call": "retrieveSkillContext",
                 }
             )
 
-        matches.sort(key=lambda item: (-item["score"], item["skill_id"]))
-        return {"matches": matches[:max_results]}
+        return {
+            "matches": matches[:max_results],
+            "available_skills": [
+                self._public_skill_metadata(skill) for skill in self._skills.values()
+            ],
+        }
 
     def retrieve(
         self,
@@ -504,18 +370,29 @@ class SkillRuntime:
             if include_debug:
                 packet["debug"] = {
                     "why_selected": match["reason"],
-                    "score": match["score"],
+                    "selection_order": match["selection_order"],
                     "skill_root": str(skill.root),
                 }
             selected.append(packet)
 
         if not selected:
-            decision = {
-                "selected": False,
-                "next_action": "answerWithoutSkill",
-                "reason": "No available skill matched the task name or description.",
-                "stop_retrieval": True,
-            }
+            if self._skills:
+                decision = {
+                    "selected": False,
+                    "next_action": "selectSkillOrAnswer",
+                    "reason": (
+                        "No explicit skill was selected. Review available_skills; retry once "
+                        "with exact hinted_skill_ids only when a description clearly matches."
+                    ),
+                    "stop_retrieval": False,
+                }
+            else:
+                decision = {
+                    "selected": False,
+                    "next_action": "answerWithoutSkill",
+                    "reason": "No skills are available.",
+                    "stop_retrieval": True,
+                }
         elif any_truncated:
             decision = {
                 "selected": True,
@@ -534,7 +411,11 @@ class SkillRuntime:
                 "stop_retrieval": True,
             }
 
-        result: dict[str, Any] = {"selected_skills": selected, "decision": decision}
+        result: dict[str, Any] = {
+            "selected_skills": selected,
+            "available_skills": resolved["available_skills"],
+            "decision": decision,
+        }
         if include_debug:
             result["debug"] = {
                 "available_skill_count": len(self._skills),

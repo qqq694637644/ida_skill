@@ -318,6 +318,57 @@ def test_execute_idapython_timeout_is_bounded_for_gpt_actions(monkeypatch) -> No
     assert fake_server.requests[-1]["timeout"] == 40.0
 
 
+def test_read_actions_use_gpt_action_timeout(monkeypatch) -> None:
+    fake_server = FakeIdaServer()
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
+    client = TestClient(create_app())
+
+    requests = [
+        ("/v1/ida/functions", {"limit": 10}),
+        ("/v1/ida/decompile", {"name": "main"}),
+        ("/v1/ida/xrefs", {"name": "main", "limit": 10}),
+    ]
+    for path, body in requests:
+        response = client.post(path, json=body)
+        assert response.status_code == 200
+
+    timeout_by_endpoint = {
+        request["endpoint"]: request["timeout"] for request in fake_server.requests
+    }
+    assert timeout_by_endpoint["/functions"] == ida_actions.GPT_ACTION_READ_TIMEOUT_SECONDS
+    assert timeout_by_endpoint["/decompile"] == ida_actions.GPT_ACTION_READ_TIMEOUT_SECONDS
+    assert timeout_by_endpoint["/xrefs"] == ida_actions.GPT_ACTION_READ_TIMEOUT_SECONDS
+
+
+def test_execute_target_resolution_error_is_response_bounded(monkeypatch) -> None:
+    fake_server = FakeIdaServer()
+    fake_server.resolve_target = lambda _request: (None, None, "X" * 120_000)
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
+    client = TestClient(create_app())
+
+    response = client.post("/v1/ida/execute", json={"code": "result = 1"})
+
+    assert response.status_code == 200
+    assert len(response.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    assert response.json()["response_truncated"] is True
+
+
+def test_ida_request_text_fields_have_length_limits(monkeypatch) -> None:
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: FakeIdaServer())
+    client = TestClient(create_app())
+
+    requests = [
+        ("/v1/ida/database-info", {"instance_id": "I" * 513}),
+        ("/v1/ida/functions", {"name_contains": "N" * 513}),
+        ("/v1/ida/decompile", {"name": "N" * 513}),
+        ("/v1/ida/xrefs", {"address": "A" * 129}),
+        ("/v1/ida/execute", {"script_path": "P" * 4097}),
+    ]
+    for path, body in requests:
+        with_body = client.post(path, json=body)
+        assert with_body.status_code == 422, path
+
+
 def test_large_ida_action_responses_are_bounded(monkeypatch) -> None:
     fake_server = LargeResponseIdaServer()
     monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
@@ -395,6 +446,24 @@ def test_hard_response_fallback_stays_within_the_limit() -> None:
     assert ida_actions._json_char_count(bounded) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
     assert bounded["response_truncated"] is True
     assert bounded["response_preview_original_chars"] > ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+
+
+def test_list_budget_never_returns_a_non_advancing_offset() -> None:
+    bounded = ida_actions._budget_list_response(
+        {
+            "functions": [],
+            "truncated": True,
+            "next_offset": 100,
+        },
+        list_key="functions",
+        offset=100,
+        source_has_more=True,
+    )
+
+    assert bounded["returned"] == 0
+    assert bounded["next_offset"] is None
+    assert bounded["more_available"] is True
+    assert "no forward progress" in bounded["truncation_hint"]
 
 
 def test_xrefs_adapter_supports_bounded_offset_pagination(monkeypatch) -> None:

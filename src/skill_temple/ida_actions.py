@@ -24,6 +24,7 @@ IDA_ERROR_HINT = (
 )
 PLUGIN_RESPONSE_TIMEOUT_MARGIN_SECONDS = 5
 GPT_ACTION_EXECUTION_TIMEOUT_MAX_SECONDS = 35
+GPT_ACTION_READ_TIMEOUT_SECONDS = 35
 IDA_ACTION_RESPONSE_MAX_CHARS = 80_000
 XREF_ADAPTER_MAX_ITEMS = 5_000
 DECOMPILE_PSEUDOCODE_MAX_CHARS = 50_000
@@ -31,6 +32,12 @@ EXECUTE_STDOUT_MAX_CHARS = 16_000
 EXECUTE_STDERR_MAX_CHARS = 16_000
 EXECUTE_RESULT_MAX_JSON_CHARS = 28_000
 EXECUTE_ERROR_MAX_JSON_CHARS = 8_000
+INSTANCE_ID_MAX_CHARS = 512
+SYMBOL_NAME_MAX_CHARS = 512
+ADDRESS_MAX_CHARS = 128
+FILTER_TEXT_MAX_CHARS = 512
+SEGMENT_NAME_MAX_CHARS = 128
+SCRIPT_PATH_MAX_CHARS = 4096
 
 
 class StrictIdaRequest(BaseModel):
@@ -40,6 +47,7 @@ class StrictIdaRequest(BaseModel):
 class IdaTargetRequest(StrictIdaRequest):
     instance_id: str | None = Field(
         default=None,
+        max_length=INSTANCE_ID_MAX_CHARS,
         description="Target IDA instance id or unique substring from listIdaInstances.",
     )
     port: int | None = Field(
@@ -72,15 +80,15 @@ class ListIdaFunctionsRequest(IdaTargetRequest):
         le=5000,
         description="Requested function count; the adapter may return fewer with next_offset.",
     )
-    name_contains: str | None = None
-    segment: str | None = None
+    name_contains: str | None = Field(default=None, max_length=FILTER_TEXT_MAX_CHARS)
+    segment: str | None = Field(default=None, max_length=SEGMENT_NAME_MAX_CHARS)
     include_thunks: bool = False
     include_library_functions: bool = False
 
 
 class DecompileIdaFunctionRequest(IdaTargetRequest):
-    address: str | None = None
-    name: str | None = None
+    address: str | None = Field(default=None, max_length=ADDRESS_MAX_CHARS)
+    name: str | None = Field(default=None, max_length=SYMBOL_NAME_MAX_CHARS)
     include_disassembly: bool = False
 
     @model_validator(mode="after")
@@ -90,8 +98,8 @@ class DecompileIdaFunctionRequest(IdaTargetRequest):
 
 
 class GetIdaXrefsRequest(IdaTargetRequest):
-    address: str | None = None
-    name: str | None = None
+    address: str | None = Field(default=None, max_length=ADDRESS_MAX_CHARS)
+    name: str | None = Field(default=None, max_length=SYMBOL_NAME_MAX_CHARS)
     direction: Literal["to", "from"] = "to"
     xref_kind: Literal["all", "code", "data"] = "all"
     offset: int = Field(
@@ -124,6 +132,7 @@ class ExecuteIdapythonRequest(IdaTargetRequest):
     code: str | None = Field(default=None, description="IDAPython code string to run.")
     script_path: str | None = Field(
         default=None,
+        max_length=SCRIPT_PATH_MAX_CHARS,
         description="Path to a Python script file readable by the IDA machine.",
     )
     capture_output: bool = True
@@ -247,6 +256,18 @@ def _budget_list_response(
     if source_has_more is None:
         source_has_more = bool(payload.get("truncated")) or payload.get("next_offset") is not None
 
+    def enforce_forward_progress(result: dict[str, Any]) -> dict[str, Any]:
+        next_offset = result.get("next_offset")
+        if isinstance(next_offset, int) and next_offset <= offset:
+            result = dict(result)
+            result["next_offset"] = None
+            result["more_available"] = bool(source_has_more)
+            result["truncation_hint"] = (
+                "Pagination made no forward progress; narrow the query or use "
+                "executeIdapython for a targeted read."
+            )
+        return result
+
     def build(count: int) -> dict[str, Any]:
         result = dict(payload)
         result[list_key] = original_items[:count]
@@ -275,7 +296,7 @@ def _budget_list_response(
             result.pop("response_char_limit", None)
         return result
 
-    full = build(len(original_items))
+    full = enforce_forward_progress(build(len(original_items)))
     if _json_char_count(full) <= IDA_ACTION_RESPONSE_MAX_CHARS:
         return full
 
@@ -307,7 +328,7 @@ def _budget_list_response(
                 result.pop("truncation_hint", None)
         else:
             result["next_offset"] = candidate_next_offset
-    return _hard_cap_response(result)
+    return _hard_cap_response(enforce_forward_progress(result))
 
 
 def _budget_decompile_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -417,7 +438,7 @@ def _request_plugin(
     *,
     method: str = "GET",
     data: dict[str, Any] | None = None,
-    timeout: float = 60.0,
+    timeout: float = GPT_ACTION_READ_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     port, resolved_instance_id, label = _resolve_target(server, request)
     if port is None:
@@ -521,7 +542,14 @@ def register_ida_actions(app: FastAPI) -> None:
             "include_thunks": request.include_thunks,
             "include_library_functions": request.include_library_functions,
         }
-        result = _request_plugin(server, request, "/functions", method="POST", data=payload)
+        result = _request_plugin(
+            server,
+            request,
+            "/functions",
+            method="POST",
+            data=payload,
+            timeout=GPT_ACTION_READ_TIMEOUT_SECONDS,
+        )
         return _budget_list_response(
             result,
             list_key="functions",
@@ -547,7 +575,14 @@ def register_ida_actions(app: FastAPI) -> None:
             "name": request.name,
             "include_disassembly": request.include_disassembly,
         }
-        result = _request_plugin(server, request, "/decompile", method="POST", data=payload)
+        result = _request_plugin(
+            server,
+            request,
+            "/decompile",
+            method="POST",
+            data=payload,
+            timeout=GPT_ACTION_READ_TIMEOUT_SECONDS,
+        )
         return _budget_decompile_response(result)
 
     @app.post(
@@ -572,7 +607,14 @@ def register_ida_actions(app: FastAPI) -> None:
             "xref_kind": request.xref_kind,
             "limit": fetch_limit,
         }
-        result = _request_plugin(server, request, "/xrefs", method="POST", data=payload)
+        result = _request_plugin(
+            server,
+            request,
+            "/xrefs",
+            method="POST",
+            data=payload,
+            timeout=GPT_ACTION_READ_TIMEOUT_SECONDS,
+        )
         xrefs = result.get("xrefs")
         if not isinstance(xrefs, list):
             return _hard_cap_response(result)
@@ -614,7 +656,7 @@ def register_ida_actions(app: FastAPI) -> None:
 
         port, resolved_instance_id, label = _resolve_target(server, request)
         if port is None:
-            return _tool_error(label)
+            return _budget_execute_response(_tool_error(label))
 
         payload = {
             "code": request.code,

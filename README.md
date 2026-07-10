@@ -32,22 +32,15 @@ skills/
 ```yaml
 ---
 name: idapython
-description: Use for IDAPython scripting, live IDA analysis, Hex-Rays, functions, xrefs, types, patches, and IDB automation.
-aliases:
-  - IDA
-  - IDA 脚本
-keywords:
-  - 反编译
-  - 交叉引用
-  - 批量重命名
+description: Use for IDAPython scripting, live IDA analysis, Hex-Rays, functions, xrefs, types, patches, and IDB automation. 中文：用于 IDA/IDAPython 脚本、反编译、交叉引用和 IDB 自动化。
 ---
 ```
 
-The frontmatter `name` is the stable `skill_id`. `name` and `description` are required.
-Optional `aliases` and `keywords` add multilingual discovery terms while keeping
-`SKILL.md` as the only entrypoint. The runtime uses Unicode-aware CJK n-grams for
-Chinese discovery and filters generic words such as “使用”, “工具”, “请求”, and
-“分析”. No `skill.json` or separate index file is required.
+The frontmatter `name` is the stable `skill_id`; `name` and `description` are required.
+As in Codex, the model sees the available names and descriptions and decides whether a
+skill clearly applies. The server does not rank descriptions or expand aliases and
+keywords. Use a bilingual description when the Custom GPT serves Chinese and English
+users. No `skill.json` or separate index file is required.
 
 The body of `SKILL.md` should:
 
@@ -68,7 +61,7 @@ The public OpenAPI schema exposes:
 
 | Operation | Method | Path | Purpose |
 | --- | --- | --- | --- |
-| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Select matching skills and return each selected `SKILL.md` within the response budget. |
+| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Return the skill catalog and load explicitly selected `SKILL.md` entrypoints. |
 | `readSkillContent` | `POST` | `/v1/skills/read` | Read an exact resource path referenced by a selected skill. |
 | `searchSkillDocs` | `POST` | `/v1/skills/search` | Fallback keyword search inside one selected skill. |
 | `listIdaInstances` | `POST` | `/v1/ida/instances` | List running local IDA plugin instances. |
@@ -82,13 +75,20 @@ All public operations publish `x-openai-isConsequential: false` for this trusted
 
 ### Select a skill
 
+Without an explicit hint, the first call returns `available_skills` only. The model
+reviews each `name` and `description`. If exactly one description clearly matches, it
+retries once with the exact `skill_id`:
+
 ```json
 {
-  "query": "@idapython walk ctree calls with ctree_visitor_t",
+  "query": "反编译 main 函数",
   "hinted_skill_ids": ["idapython"],
   "allow_skill_chaining": false
 }
 ```
+
+Exact `@idapython` and `$idapython` mentions are also accepted. The runtime does not
+silently select a skill from fuzzy keyword overlap.
 
 A selected skill packet contains:
 
@@ -139,7 +139,9 @@ Use search only when the selected `SKILL.md` does not identify an exact relevant
 
 ## Multiple skills
 
-Set `allow_skill_chaining=true` only when the task clearly needs multiple domains. The runtime returns up to three top matching skills with `primary` and `secondary` roles.
+Set `allow_skill_chaining=true` only when the model explicitly selects multiple domains.
+The runtime loads up to three exact hinted or explicitly mentioned skills with `primary`
+and `secondary` roles.
 
 Skill entrypoints share a 60,000-character response budget. A single selected
 `SKILL.md` receives at most 24,000 characters; multi-skill responses divide the
