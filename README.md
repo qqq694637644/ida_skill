@@ -33,10 +33,21 @@ skills/
 ---
 name: idapython
 description: Use for IDAPython scripting, live IDA analysis, Hex-Rays, functions, xrefs, types, patches, and IDB automation.
+aliases:
+  - IDA
+  - IDA 脚本
+keywords:
+  - 反编译
+  - 交叉引用
+  - 批量重命名
 ---
 ```
 
-The frontmatter `name` is the stable `skill_id`; `name` and `description` are the only discovery metadata. No `skill.json` or separate index file is required.
+The frontmatter `name` is the stable `skill_id`. `name` and `description` are required.
+Optional `aliases` and `keywords` add multilingual discovery terms while keeping
+`SKILL.md` as the only entrypoint. The runtime uses Unicode-aware CJK n-grams for
+Chinese discovery and filters generic words such as “使用”, “工具”, “请求”, and
+“分析”. No `skill.json` or separate index file is required.
 
 The body of `SKILL.md` should:
 
@@ -46,7 +57,10 @@ The body of `SKILL.md` should:
 - avoid duplicating the detailed reference material;
 - define completion and failure behavior that is not already obvious from the Action schema.
 
-The runtime returns the selected `SKILL.md` in full. It does not automatically inject all files under the skill directory. The model follows the paths named by the selected skill and reads only the resources required for the current task.
+The runtime returns the selected `SKILL.md` within the response budget and provides
+continuation metadata when it is truncated. It does not automatically inject all files
+under the skill directory. The model follows the paths named by the selected skill and
+reads only the resources required for the current task.
 
 ## GPT Action API
 
@@ -54,7 +68,7 @@ The public OpenAPI schema exposes:
 
 | Operation | Method | Path | Purpose |
 | --- | --- | --- | --- |
-| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Select matching skills and return each selected `SKILL.md` in full. |
+| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Select matching skills and return each selected `SKILL.md` within the response budget. |
 | `readSkillContent` | `POST` | `/v1/skills/read` | Read an exact resource path referenced by a selected skill. |
 | `searchSkillDocs` | `POST` | `/v1/skills/search` | Fallback keyword search inside one selected skill. |
 | `listIdaInstances` | `POST` | `/v1/ida/instances` | List running local IDA plugin instances. |
@@ -161,9 +175,11 @@ The Custom GPT calls only the FastAPI/OpenAPI surface. It does not call the MCP 
 
 For current IDB facts, use live IDA Actions rather than documentation or assumptions. `executeIdapython` is available for custom analysis, bulk processing, renaming, comments, patches, type changes, and validation. The GPT Action adapter accepts `timeout_seconds` from 1 to 35 seconds so the plugin timeout plus its 5-second response margin remains within the Action round trip. Inspect `status`, `stdout`, `stderr`, `result`, and `error` before reporting success. Keep mutations within the user's requested scope and perform a targeted read-back when the execution response alone does not prove the change.
 
-IDA Action responses are capped at 80,000 serialized JSON characters. Function and
-xref lists are reduced to a fitting page and return `truncated` plus `next_offset`.
-The xref adapter supports offsets inside its 5,000-item window. Decompile responses
+Every public IDA Action response is capped at 80,000 serialized JSON characters.
+Instance, function, and xref lists are reduced to a fitting page and return
+`truncated` plus `next_offset`. The xref adapter supports offsets inside its
+5,000-item window and never repeats the current offset when an oversized final item
+cannot be returned. Database metadata uses the same hard response fallback. Decompile responses
 report `pseudocode_truncated` and `disassembly_truncated`; execution responses report
 `stdout_truncated`, `stderr_truncated`, `result_truncated`, and `error_truncated` when
 the corresponding field is shortened.

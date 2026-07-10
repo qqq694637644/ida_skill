@@ -94,6 +94,20 @@ class FakeIdaServer:
 
 
 class LargeResponseIdaServer(FakeIdaServer):
+    def list_instances(self) -> dict[str, dict[str, object]]:
+        return {
+            f"{index:04d}_sample_{index}.exe": {
+                "pid": 1000 + index,
+                "host": "127.0.0.1",
+                "port": 13338 + index,
+                "database": f"sample_{index}.exe",
+                "database_path": "C:/samples/" + "D" * 120 + f"/sample_{index}.exe.i64",
+                "platform": "win32",
+                "started_at": "2026-07-10 00:00:00",
+            }
+            for index in range(1500)
+        }
+
     def make_ida_request(
         self,
         endpoint: str,
@@ -113,6 +127,11 @@ class LargeResponseIdaServer(FakeIdaServer):
                 "timeout": timeout,
             }
         )
+        if endpoint == "/metadata":
+            return {
+                "database": "sample.exe",
+                "metadata": "M" * 150_000,
+            }
         if endpoint == "/functions":
             count = int(data.get("limit", 5000))
             offset = int(data.get("offset", 0))
@@ -172,6 +191,43 @@ class LargeResponseIdaServer(FakeIdaServer):
             port=port,
             timeout=timeout,
         )
+
+
+class OversizedLastXrefServer(FakeIdaServer):
+    def make_ida_request(
+        self,
+        endpoint: str,
+        *,
+        method: str = "GET",
+        data: dict[str, object] | None = None,
+        port: int | None = None,
+        timeout: float = 60.0,
+    ) -> dict[str, object]:
+        if endpoint != "/xrefs":
+            return super().make_ida_request(
+                endpoint,
+                method=method,
+                data=data,
+                port=port,
+                timeout=timeout,
+            )
+
+        data = data or {}
+        count = int(data.get("limit", 5000))
+        xrefs = [
+            {"index": index, "source_disassembly": "nop"}
+            for index in range(count)
+        ]
+        if count == ida_actions.XREF_ADAPTER_MAX_ITEMS:
+            xrefs[-1] = {
+                "index": count - 1,
+                "source_disassembly": "X" * 120_000,
+            }
+        return {
+            "returned": count,
+            "truncated": False,
+            "xrefs": xrefs,
+        }
 
 
 def test_ida_action_endpoints_call_ida_server(monkeypatch) -> None:
@@ -267,6 +323,31 @@ def test_large_ida_action_responses_are_bounded(monkeypatch) -> None:
     monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
     client = TestClient(create_app())
 
+    instances = client.post("/v1/ida/instances", json={"limit": 1500})
+    assert instances.status_code == 200
+    assert len(instances.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    instances_body = instances.json()
+    assert instances_body["response_truncated"] is True
+    assert instances_body["truncated"] is True
+    assert instances_body["next_offset"] == instances_body["returned"]
+    next_instances = client.post(
+        "/v1/ida/instances",
+        json={"offset": instances_body["next_offset"], "limit": 1500},
+    )
+    assert next_instances.status_code == 200
+    next_instances_body = next_instances.json()
+    first_ids = {item["instance_id"] for item in instances_body["instances"]}
+    second_ids = {item["instance_id"] for item in next_instances_body["instances"]}
+    assert first_ids.isdisjoint(second_ids)
+    assert next_instances_body["offset"] == instances_body["next_offset"]
+
+    metadata = client.post("/v1/ida/database-info", json={})
+    assert metadata.status_code == 200
+    assert len(metadata.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    metadata_body = metadata.json()
+    assert metadata_body["response_truncated"] is True
+    assert metadata_body["response_char_limit"] == ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+
     functions = client.post("/v1/ida/functions", json={"limit": 5000})
     assert functions.status_code == 200
     assert len(functions.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
@@ -338,6 +419,25 @@ def test_xrefs_adapter_supports_bounded_offset_pagination(monkeypatch) -> None:
         json={"name": "target", "offset": 4999, "limit": 2},
     )
     assert invalid.status_code == 422
+
+
+def test_oversized_last_xref_does_not_repeat_the_same_offset(monkeypatch) -> None:
+    fake_server = OversizedLastXrefServer()
+    monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/ida/xrefs",
+        json={"name": "target", "offset": 4999, "limit": 1},
+    )
+
+    assert response.status_code == 200
+    assert len(response.text) <= ida_actions.IDA_ACTION_RESPONSE_MAX_CHARS
+    body = response.json()
+    assert body["oversized_item_omitted"] is True
+    assert body["next_offset"] is None
+    assert body["next_offset"] != 4999
+    assert body["more_available"] is False
 
 
 def test_decompile_and_xrefs_require_one_target(monkeypatch) -> None:

@@ -25,6 +25,8 @@
 
 当用户明确点名某个 Skill，或任务明显符合某个 Skill 的用途时，调用 retrieveSkillContext。把用户原始任务放进 query；明确知道 skill_id 时放进 hinted_skill_ids。只有任务确实需要多个领域时才设置 allow_skill_chaining=true。
 
+涉及 IDA、IDAPython、反编译、伪代码、交叉引用、函数、地址、patch、重命名、类型或 IDB 自动化的任务，调用 retrieveSkillContext 时传入 hinted_skill_ids=["idapython"]。服务端也支持中文 aliases/keywords 自动发现，但已知目标 Skill 时优先传明确 hint。
+
 retrieveSkillContext 返回的每个 selected_skills 项都在 instructions 字段中包含所选 SKILL.md 的内容。若 truncated=true，使用 readSkillContent 读取同一 Skill 的 SKILL.md，并从 next_start_line 继续。对每个实际需要的 Skill：
 
 1. 完整阅读 instructions，不要只读其中一部分。

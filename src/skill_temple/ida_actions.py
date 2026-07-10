@@ -51,7 +51,13 @@ class IdaTargetRequest(StrictIdaRequest):
 
 
 class ListIdaInstancesRequest(StrictIdaRequest):
-    pass
+    offset: int = Field(default=0, ge=0, description="IDA instance offset for pagination.")
+    limit: int = Field(
+        default=200,
+        ge=1,
+        le=5000,
+        description="Requested instance count; the adapter may return fewer with next_offset.",
+    )
 
 
 class GetIdaDatabaseInfoRequest(IdaTargetRequest):
@@ -289,7 +295,17 @@ def _budget_list_response(
         result["oversized_item_preview"] = preview[:8_000]
         result["oversized_item_original_chars"] = len(preview)
         candidate_next_offset = offset + 1
-        if max_next_offset is None or candidate_next_offset < max_next_offset:
+        if max_next_offset is not None and candidate_next_offset >= max_next_offset:
+            result["next_offset"] = None
+            result["more_available"] = bool(source_has_more)
+            if source_has_more:
+                result["truncation_hint"] = (
+                    "The adapter pagination window is exhausted; use executeIdapython "
+                    "for a custom narrower query."
+                )
+            else:
+                result.pop("truncation_hint", None)
+        else:
             result["next_offset"] = candidate_next_offset
     return _hard_cap_response(result)
 
@@ -432,19 +448,38 @@ def register_ida_actions(app: FastAPI) -> None:
         description="List live IDA databases registered by the local IDA-Script-MCP plugin.",
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def list_ida_instances(_request: ListIdaInstancesRequest) -> dict[str, Any]:
+    def list_ida_instances(request: ListIdaInstancesRequest) -> dict[str, Any]:
         server = _load_ida_server_module()
         if server is None:
             return _setup_error()
 
         records = _instance_records(server)
+        total = len(records)
         if not records:
-            return {
+            return _hard_cap_response({
                 "count": 0,
+                "returned": 0,
+                "offset": request.offset,
+                "next_offset": None,
+                "truncated": False,
                 "instances": [],
                 "hint": "No IDA instances found. Start IDA Pro and enable the plugin.",
-            }
-        return {"count": len(records), "instances": records}
+            })
+
+        page_end = request.offset + request.limit
+        page = records[request.offset:page_end]
+        return _budget_list_response(
+            {
+                "count": total,
+                "offset": request.offset,
+                "limit": request.limit,
+                "instances": page,
+            },
+            list_key="instances",
+            offset=request.offset,
+            source_has_more=page_end < total,
+            max_next_offset=total,
+        )
 
     @app.post(
         "/v1/ida/database-info",
@@ -460,7 +495,9 @@ def register_ida_actions(app: FastAPI) -> None:
         server = _load_ida_server_module()
         if server is None:
             return _setup_error()
-        return _request_plugin(server, request, "/metadata", timeout=10.0)
+        return _hard_cap_response(
+            _request_plugin(server, request, "/metadata", timeout=10.0)
+        )
 
     @app.post(
         "/v1/ida/functions",

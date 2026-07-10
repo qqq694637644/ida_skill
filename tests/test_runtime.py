@@ -91,15 +91,53 @@ class RuntimeTests(unittest.TestCase):
             "please use this tool",
             "use this configuration",
             "analysis request",
+            "请使用这个工具",
+            "请帮我处理这个请求",
+            "分析这个配置",
         ]:
             with self.subTest(query=query):
                 self.assertEqual(runtime.resolve(query)["matches"], [])
 
-        for query in ["find xrefs in IDA", "Hex-Rays decompile"]:
+        for query in [
+            "find xrefs in IDA",
+            "Hex-Rays decompile",
+            "反编译 main 函数",
+            "查找 strcpy 的交叉引用",
+            "用 IDAPython 批量重命名函数",
+            "给地址打补丁",
+        ]:
             with self.subTest(query=query):
                 result = runtime.resolve(query)
                 self.assertTrue(result["matches"])
                 self.assertEqual(result["matches"][0]["skill_id"], "idapython")
+
+    def test_multilingual_discovery_metadata_accepts_lists_and_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_root = skills_root / "demo"
+            skill_root.mkdir(parents=True)
+            (skill_root / "SKILL.md").write_text(
+                "---\n"
+                "name: demo\n"
+                "description: Use for demonstration tasks.\n"
+                "aliases: 演示工具\n"
+                "keywords:\n"
+                "  - 中文发现\n"
+                "  - multilingual\n"
+                "---\n\n# Demo\n",
+                encoding="utf-8",
+            )
+
+            runtime = SkillRuntime(skills_root)
+
+            self.assertEqual(
+                runtime.resolve("请执行中文发现")["matches"][0]["skill_id"],
+                "demo",
+            )
+            self.assertEqual(
+                runtime.resolve("使用演示工具")["matches"][0]["skill_id"],
+                "demo",
+            )
 
     def test_retrieve_returns_complete_skill_entrypoint(self) -> None:
         runtime = load_runtime()

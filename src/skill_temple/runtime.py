@@ -43,6 +43,10 @@ MAX_SKILL_SCAN_DEPTH = 6
 SKILL_NAME_MAX_CHARS = 64
 SKILL_DESCRIPTION_MAX_CHARS = 1024
 _TEXT_REFERENCE_SUFFIXES = {".md", ".rst", ".txt"}
+SKILL_ALIASES_MAX_ITEMS = 32
+SKILL_KEYWORDS_MAX_ITEMS = 64
+SKILL_DISCOVERY_TERM_MAX_CHARS = 64
+_CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _DISCOVERY_STOPWORDS = {
     "a",
     "an",
@@ -73,6 +77,15 @@ _DISCOVERY_STOPWORDS = {
     "using",
     "with",
     "work",
+    "分析",
+    "使用",
+    "任务",
+    "请求",
+    "工具",
+    "帮助",
+    "配置",
+    "这个",
+    "进行",
 }
 
 
@@ -96,6 +109,8 @@ class Skill:
     root: Path
     name: str
     description: str
+    discovery_aliases: tuple[str, ...] = ()
+    keywords: tuple[str, ...] = ()
 
     @property
     def entrypoint(self) -> str:
@@ -103,7 +118,15 @@ class Skill:
 
     @property
     def aliases(self) -> list[str]:
-        return _unique_preserve_order([f"@{self.skill_id}", self.skill_id, self.name])
+        return _unique_preserve_order(
+            [f"@{self.skill_id}", self.skill_id, self.name, *self.discovery_aliases]
+        )
+
+    @property
+    def discovery_text(self) -> str:
+        return " ".join(
+            [self.name, self.description, *self.discovery_aliases, *self.keywords]
+        )
 
 
 def load_runtime(skills_dir: str | Path | None = None) -> SkillRuntime:
@@ -181,6 +204,19 @@ def _tokens(text: str) -> list[str]:
     return [token.lower() for token in _TOKEN_RE.findall(text)]
 
 
+def _discovery_tokens(text: str) -> set[str]:
+    tokens = set(_tokens(text))
+    for run in _CJK_RUN_RE.findall(text):
+        normalized = run.casefold()
+        tokens.add(normalized)
+        for size in range(2, min(4, len(normalized)) + 1):
+            tokens.update(
+                normalized[index : index + size]
+                for index in range(0, len(normalized) - size + 1)
+            )
+    return tokens
+
+
 def _unique_preserve_order(items: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -224,6 +260,45 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     data = {str(key): value for key, value in parsed.items()}
     body = "\n".join(lines[closing + 1 :])
     return data, body
+
+
+def _frontmatter_string_list(
+    frontmatter: dict[str, Any],
+    key: str,
+    *,
+    max_items: int,
+) -> tuple[str, ...]:
+    raw_value = frontmatter.get(key)
+    if raw_value is None:
+        return ()
+    if isinstance(raw_value, str):
+        values = [raw_value]
+    elif isinstance(raw_value, list):
+        values = raw_value
+    else:
+        raise SkillRuntimeError(f"SKILL.md frontmatter {key} must be a string or list")
+
+    if len(values) > max_items:
+        raise SkillRuntimeError(
+            f"SKILL.md frontmatter {key} exceeds {max_items} items"
+        )
+
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise SkillRuntimeError(
+                f"SKILL.md frontmatter {key} entries must be strings"
+            )
+        term = value.strip()
+        if not term:
+            continue
+        if len(term) > SKILL_DISCOVERY_TERM_MAX_CHARS:
+            raise SkillRuntimeError(
+                f"SKILL.md frontmatter {key} entry exceeds "
+                f"{SKILL_DISCOVERY_TERM_MAX_CHARS} characters"
+            )
+        normalized.append(term)
+    return tuple(_unique_preserve_order(normalized))
 
 
 class SkillRuntime:
@@ -288,12 +363,24 @@ class SkillRuntime:
                 "SKILL.md frontmatter description exceeds "
                 f"{SKILL_DESCRIPTION_MAX_CHARS} characters: {manifest_path}"
             )
+        aliases = _frontmatter_string_list(
+            frontmatter,
+            "aliases",
+            max_items=SKILL_ALIASES_MAX_ITEMS,
+        )
+        keywords = _frontmatter_string_list(
+            frontmatter,
+            "keywords",
+            max_items=SKILL_KEYWORDS_MAX_ITEMS,
+        )
         skill_id = _safe_skill_id(name)
         return Skill(
             skill_id=skill_id,
             root=manifest_path.parent.resolve(),
             name=name,
             description=description,
+            discovery_aliases=aliases,
+            keywords=keywords,
         )
 
     def list_skills(self) -> dict[str, Any]:
@@ -318,7 +405,7 @@ class SkillRuntime:
 
         hint_order = {skill_id: index for index, skill_id in enumerate(hinted_skill_ids)}
         query_lower = query.lower()
-        query_tokens = set(_tokens(query))
+        query_tokens = _discovery_tokens(query)
         matches: list[dict[str, Any]] = []
 
         for skill in self._skills.values():
@@ -334,7 +421,7 @@ class SkillRuntime:
                     score += 25.0 if alias.startswith("@") else 12.0
                     reasons.append(f"matched skill name {alias!r}")
 
-            discovery_tokens = set(_tokens(f"{skill.name} {skill.description}"))
+            discovery_tokens = _discovery_tokens(skill.discovery_text)
             overlap = (query_tokens & discovery_tokens) - _DISCOVERY_STOPWORDS
             if overlap:
                 score += min(20.0, len(overlap) * 4.0)
