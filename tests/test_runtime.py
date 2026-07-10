@@ -238,6 +238,44 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(app.openapi()["servers"], [{"url": "https://skills.example.com/api"}])
 
+    def test_bearer_token_from_env_protects_action_endpoints(self) -> None:
+        with patch.dict(os.environ, {"SKILL_TEMPLE_BEARER_TOKEN": "test-secret"}, clear=False):
+            client = TestClient(create_app())
+
+        openapi_response = client.get("/openapi.json")
+        self.assertEqual(openapi_response.status_code, 200)
+        schema = openapi_response.json()
+        self.assertEqual(
+            schema["components"]["securitySchemes"]["BearerAuth"],
+            {"type": "http", "scheme": "bearer"},
+        )
+        self.assertEqual(
+            schema["paths"]["/v1/skills/read"]["post"]["security"],
+            [{"BearerAuth": []}],
+        )
+
+        missing_auth = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "idapython", "path": "SKILL.md", "max_lines": 5},
+        )
+        self.assertEqual(missing_auth.status_code, 401)
+        self.assertEqual(missing_auth.headers["www-authenticate"], "Bearer")
+
+        wrong_auth = client.post(
+            "/v1/skills/read",
+            headers={"Authorization": "Bearer wrong-secret"},
+            json={"skill_id": "idapython", "path": "SKILL.md", "max_lines": 5},
+        )
+        self.assertEqual(wrong_auth.status_code, 401)
+
+        authorized = client.post(
+            "/v1/skills/read",
+            headers={"Authorization": "Bearer test-secret"},
+            json={"skill_id": "idapython", "path": "SKILL.md", "max_lines": 5},
+        )
+        self.assertEqual(authorized.status_code, 200)
+        self.assertIn("name: idapython", authorized.json()["content"])
+
     def test_http_endpoints_work_through_testclient(self) -> None:
         client = TestClient(create_app())
 

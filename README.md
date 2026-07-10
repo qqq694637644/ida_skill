@@ -228,6 +228,8 @@ SKILL_TEMPLE_SKILLS_DIR = "C:\path\to\skills"
 
 The gateway reads a `.env` file from the current working directory automatically.
 Real environment variables and explicit CLI arguments still take precedence.
+Copy `.env.example` to `.env` for the integrated IDA setup, then replace the
+placeholder Bearer token with a real local secret.
 
 You can also set the value directly in PowerShell:
 
@@ -246,12 +248,25 @@ For the integrated IDAPython skill shipped by the `ida-script-mcp-main` submodul
 
 ```dotenv
 SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-mcp-main/src/ida_script_mcp/resources
+SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
 IDA_SCRIPT_MCP_HOST=127.0.0.1
 ```
 
 `IDA_SCRIPT_MCP_HOST=127.0.0.1` works when the gateway process and IDA Pro run on
 the same host. If they run on different machines, set it to a private address
 reachable from the gateway process.
+
+When `SKILL_TEMPLE_BEARER_TOKEN` is set, GPT Action and console retrieval
+endpoints require:
+
+```text
+Authorization: Bearer <your-token>
+```
+
+`/openapi.json`, `/health`, and the static `/console` page remain readable so the
+schema can be imported and the console can load. Configure Custom GPT Actions
+authentication as API Key / Bearer and paste the same token from your local
+`.env`.
 
 OpenAPI is available at:
 

@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import secrets
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .ida_actions import register_ida_actions
@@ -30,6 +31,8 @@ from .runtime import (
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+
+BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
 
 
 class StrictRequest(BaseModel):
@@ -222,10 +225,47 @@ def _request_server_url(request: Request) -> str:
     return _normalize_server_url(str(request.base_url)) or ""
 
 
+def _normalize_bearer_token(token: str | None) -> str | None:
+    if token is None:
+        return None
+    normalized = token.strip()
+    return normalized or None
+
+
+def _requires_bearer_auth(path: str) -> bool:
+    return path.startswith("/v1/") or path == "/console/retrieve"
+
+
+def _valid_bearer_authorization(authorization: str | None, expected_token: str) -> bool:
+    if not authorization:
+        return False
+    scheme, separator, value = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return False
+    return secrets.compare_digest(value.strip(), expected_token)
+
+
+def _add_bearer_auth_security(schema: dict[str, Any]) -> dict[str, Any]:
+    components = schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes["BearerAuth"] = {"type": "http", "scheme": "bearer"}
+
+    for path, path_item in schema.get("paths", {}).items():
+        if not _requires_bearer_auth(path):
+            continue
+        for operation in path_item.values():
+            if isinstance(operation, dict):
+                operation.setdefault("security", [{"BearerAuth": []}])
+    return schema
+
+
 def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
         server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
+    )
+    bearer_token = _normalize_bearer_token(
+        env_value_from_environment_or_dotenv(BEARER_TOKEN_ENV_VAR)
     )
 
     app = FastAPI(
@@ -239,6 +279,36 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
     )
+
+    original_openapi = app.openapi
+
+    def openapi_with_optional_bearer_auth() -> dict[str, Any]:
+        schema = original_openapi()
+        if bearer_token:
+            _add_bearer_auth_security(schema)
+        return schema
+
+    app.openapi = openapi_with_optional_bearer_auth  # type: ignore[method-assign]
+
+    @app.middleware("http")
+    async def bearer_auth_middleware(request: Request, call_next: Any) -> Any:
+        if bearer_token and _requires_bearer_auth(request.url.path):
+            if not _valid_bearer_authorization(
+                request.headers.get("authorization"),
+                bearer_token,
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "unauthorized",
+                            "message": "Missing or invalid Bearer token.",
+                            "suggested_next_action": "configure_bearer_auth",
+                        }
+                    },
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
 
     def structured_error(
         code: str,
