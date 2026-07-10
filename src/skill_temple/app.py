@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .ida_actions import register_ida_actions
 from .runtime import (
     SkillNotFoundError,
     SkillPathError,
@@ -409,6 +410,8 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         except SkillPathError as exc:
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
+
+    register_ida_actions(app)
 
     return app
 

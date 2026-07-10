@@ -57,11 +57,7 @@ Custom GPT
 
 Do not expose the IDA plugin port directly to the public internet.
 
-### Two local services are acceptable
-
-There are two valid deployment shapes.
-
-#### Preferred shape: one FastAPI gateway plus IDA plugin
+### One local gateway service plus the IDA plugin
 
 ```text
 127.0.0.1:8001   ida_skill FastAPI GPT Actions gateway
@@ -69,9 +65,6 @@ There are two valid deployment shapes.
 ```
 
 The FastAPI gateway imports `ida_script_mcp.server` from the editable submodule install and reuses the existing target-resolution and IDA-plugin HTTP transport logic.
-
-
-This is only worth doing if the IDA Action surface grows large. For the first implementation, prefer a single OpenAPI schema from `ida_skill` because Custom GPT configuration is simpler.
 
 ## Submodule dependency strategy
 
@@ -106,17 +99,7 @@ SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-sc
 
 That directory contains the `idapython/` skill folder and avoids pointing Skill Temple at the full submodule root, which also contains non-skill folders such as `src/` and `tests/`.
 
-Important caveat: the current `ida-script-mcp-main/idapython` resource tree contains `SKILL.md` and many `docs/*.md` / `docs/*.rst` files, but it does not currently contain `skill.json` or `INDEX.md`.
-
-Skill Temple can load a skill from `SKILL.md` fallback metadata, and it can index the docs, so the resource tree is usable. However, fallback metadata is weaker than a real `skill.json`; it lacks first-class activation terms, response contract, policy, and recommended tool hints.
-
-Recommended metadata plan:
-
-1. Add a formal `skill.json` and optional `INDEX.md` upstream in `ida-script-mcp-main` under the `idapython/` resource directory.
-2. Keep `ida_skill` pointed at the submodule resources.
-3. Avoid copying the entire docs tree into `ida_skill`.
-
-If upstream metadata cannot be added immediately, use the fallback loader for the first smoke test, then add the upstream `skill.json` before considering the integration complete.
+The pinned submodule commit includes formal `idapython/skill.json` metadata and `INDEX.md` upstream in `ida-script-mcp-main`, so Skill Temple does not need fallback-only metadata and does not need to copy the docs tree into `ida_skill`.
 
 ## Public reverse proxy layout
 
@@ -336,7 +319,7 @@ Later, add typed response models only for fields GPT frequently needs, such as:
    external/ida-script-mcp-main/src/ida_script_mcp/resources
    ```
 4. Confirm Skill Temple can load `idapython` from the submodule resources.
-5. Add or track an upstream `idapython/skill.json` in `ida-script-mcp-main`; use fallback metadata only as a temporary smoke-test path.
+5. Keep the submodule pinned to a commit that contains upstream `idapython/skill.json` and `INDEX.md` resources.
 
 ### Phase 2: IDA Action router
 
@@ -427,7 +410,7 @@ Because this is personal-use automation, all operations are marked non-consequen
 | GPT Action import rejects schema. | Keep descriptions <= 300 chars and every operation has `x-openai-isConsequential: false`. |
 | Caddy prefix mismatch. | Set `SKILL_TEMPLE_SERVER_URL=https://gptaction.casacam.net/skills`; keep FastAPI internal paths unprefixed. |
 | Full submodule root is not a valid skills directory. | Use `external/ida-script-mcp-main/src/ida_script_mcp/resources` as `SKILL_TEMPLE_SKILLS_DIR`. |
-| `idapython` resource lacks `skill.json`. | Add upstream metadata or accept fallback only for temporary smoke tests. |
+| `idapython` metadata goes missing upstream. | Keep the submodule pinned to a commit that includes `skill.json` and `INDEX.md`. |
 | Blocking IDA plugin calls freeze the event loop. | Use sync FastAPI handlers or `anyio.to_thread.run_sync`; do not directly await blocking wrappers. |
 | Gateway and IDA run on different machines. | `IDA_SCRIPT_MCP_HOST=127.0.0.1` only works when both run on the same host; otherwise use a private reachable host. |
 

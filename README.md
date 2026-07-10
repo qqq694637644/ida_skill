@@ -32,13 +32,23 @@ Custom GPT Knowledge is useful as a reference source, but it is not a determinis
 
 ## API surface
 
-The default GPT Action-facing OpenAPI schema is intentionally small:
+The default GPT Action-facing OpenAPI schema exposes skill retrieval plus optional
+IDA Script MCP operations when the local IDA plugin is running:
 
 | Operation | Method | Path | Purpose |
 | --- | --- | --- | --- |
 | `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Default first call for tasks that may require a reusable skill. |
 | `searchSkillDocs` | `POST` | `/v1/skills/search` | Targeted follow-up keyword search inside one skill. |
 | `readSkillContent` | `POST` | `/v1/skills/read` | Precise safe-path file read. |
+| `listIdaInstances` | `POST` | `/v1/ida/instances` | List running IDA-Script-MCP plugin instances. |
+| `getIdaDatabaseInfo` | `POST` | `/v1/ida/database-info` | Get metadata for a selected IDA database. |
+| `listIdaFunctions` | `POST` | `/v1/ida/functions` | List functions from a selected IDA database. |
+| `decompileIdaFunction` | `POST` | `/v1/ida/decompile` | Decompile a function by address or name. |
+| `getIdaXrefs` | `POST` | `/v1/ida/xrefs` | Get incoming or outgoing xrefs for an address or symbol. |
+| `executeIdapython` | `POST` | `/v1/ida/execute` | Execute IDAPython code or a script file through the local plugin. |
+
+All public GPT Action operations publish `x-openai-isConsequential: false` for
+this personal-use gateway.
 
 Debug endpoints remain callable but are hidden from OpenAPI by default so GPT Actions do not treat them as normal task tools:
 
@@ -205,6 +215,8 @@ Minimal `skill.json`:
 
 ```powershell
 py -3 -m pip install -e .[dev]
+git submodule update --init --recursive
+py -3 -m pip install -e external/ida-script-mcp-main
 skill-temple --host 127.0.0.1 --port 8765
 ```
 
@@ -229,6 +241,17 @@ or:
 ```powershell
 skill-temple --skills-dir C:\path\to\skills --host 127.0.0.1 --port 8765
 ```
+
+For the integrated IDAPython skill shipped by the `ida-script-mcp-main` submodule:
+
+```dotenv
+SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-mcp-main/src/ida_script_mcp/resources
+IDA_SCRIPT_MCP_HOST=127.0.0.1
+```
+
+`IDA_SCRIPT_MCP_HOST=127.0.0.1` works when the gateway process and IDA Pro run on
+the same host. If they run on different machines, set it to a private address
+reachable from the gateway process.
 
 OpenAPI is available at:
 

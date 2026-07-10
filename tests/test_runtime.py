@@ -181,7 +181,17 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(
             operation_ids,
-            {"retrieveSkillContext", "searchSkillDocs", "readSkillContent"},
+            {
+                "retrieveSkillContext",
+                "searchSkillDocs",
+                "readSkillContent",
+                "listIdaInstances",
+                "getIdaDatabaseInfo",
+                "listIdaFunctions",
+                "decompileIdaFunction",
+                "getIdaXrefs",
+                "executeIdapython",
+            },
         )
         for path, path_item in schema["paths"].items():
             for method, operation in path_item.items():
