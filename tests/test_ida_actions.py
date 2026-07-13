@@ -318,6 +318,28 @@ def test_execute_idapython_timeout_is_bounded_for_gpt_actions(monkeypatch) -> No
     assert fake_server.requests[-1]["timeout"] == 40.0
 
 
+def test_ida_action_openapi_responses_have_object_properties() -> None:
+    schema = create_app().openapi()
+
+    for path in [
+        "/v1/ida/instances",
+        "/v1/ida/database-info",
+        "/v1/ida/functions",
+        "/v1/ida/decompile",
+        "/v1/ida/xrefs",
+        "/v1/ida/execute",
+    ]:
+        response_schema = schema["paths"][path]["post"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"]
+        response_ref = response_schema["$ref"]
+        component_name = response_ref.rsplit("/", 1)[-1]
+        component_schema = schema["components"]["schemas"][component_name]
+
+        assert component_schema["type"] == "object", path
+        assert component_schema["properties"], path
+
+
 def test_read_actions_use_gpt_action_timeout(monkeypatch) -> None:
     fake_server = FakeIdaServer()
     monkeypatch.setattr(ida_actions, "_load_ida_server_module", lambda: fake_server)
