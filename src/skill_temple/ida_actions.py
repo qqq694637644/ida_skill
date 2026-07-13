@@ -152,6 +152,131 @@ class ExecuteIdapythonRequest(IdaTargetRequest):
         return self
 
 
+class IdaActionResponse(BaseModel):
+    """Permissive response base with concrete OpenAPI properties for GPT Actions."""
+
+    model_config = ConfigDict(extra="allow")
+
+    error: Any = None
+    hint: str | None = None
+    instance_id: str | None = None
+    port: int | None = None
+    response_truncated: bool | None = None
+    response_char_limit: int | None = None
+
+
+class IdaInstanceRecord(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    instance_id: str | None = None
+    pid: int | None = None
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    database_path: str | None = None
+    platform: str | None = None
+    started_at: str | None = None
+
+
+class ListIdaInstancesResponse(IdaActionResponse):
+    count: int | None = None
+    returned: int | None = None
+    offset: int | None = None
+    limit: int | None = None
+    next_offset: int | None = None
+    truncated: bool | None = None
+    instances: list[IdaInstanceRecord] | None = None
+
+
+class GetIdaDatabaseInfoResponse(IdaActionResponse):
+    database: str | None = None
+    database_path: str | None = None
+    processor: str | None = None
+    architecture: str | None = None
+    bitness: int | str | None = None
+    endianness: str | None = None
+    image_base: int | str | None = None
+    min_ea: int | str | None = None
+    max_ea: int | str | None = None
+    function_count: int | None = None
+
+
+class IdaFunctionRecord(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str | None = None
+    ea: int | str | None = None
+    address: int | str | None = None
+    start_ea: int | str | None = None
+    end_ea: int | str | None = None
+    size: int | None = None
+    segment: str | None = None
+    is_thunk: bool | None = None
+    is_library: bool | None = None
+
+
+class ListIdaFunctionsResponse(IdaActionResponse):
+    total: int | None = None
+    returned: int | None = None
+    offset: int | None = None
+    limit: int | None = None
+    next_offset: int | None = None
+    truncated: bool | None = None
+    functions: list[IdaFunctionRecord] | None = None
+
+
+class IdaDisassemblyLine(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    ea: int | str | None = None
+    address: int | str | None = None
+    text: str | None = None
+
+
+class DecompileIdaFunctionResponse(IdaActionResponse):
+    found: bool | None = None
+    name: str | None = None
+    address: int | str | None = None
+    pseudocode: str | None = None
+    pseudocode_truncated: bool | None = None
+    disassembly: list[IdaDisassemblyLine | str] | None = None
+    disassembly_returned: int | None = None
+    disassembly_truncated: bool | None = None
+
+
+class IdaXrefRecord(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    from_ea: int | str | None = None
+    from_name: str | None = None
+    to_ea: int | str | None = None
+    to_name: str | None = None
+    type: str | None = None
+    is_code: bool | None = None
+
+
+class GetIdaXrefsResponse(IdaActionResponse):
+    returned: int | None = None
+    offset: int | None = None
+    next_offset: int | None = None
+    truncated: bool | None = None
+    more_available: bool | None = None
+    xrefs: list[IdaXrefRecord] | None = None
+
+
+class ExecuteIdapythonResponse(IdaActionResponse):
+    status: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    result: Any = None
+    duration_seconds: float | None = None
+    timeout_seconds: int | None = None
+    stdout_truncated: bool | None = None
+    stderr_truncated: bool | None = None
+    result_truncated: bool | None = None
+    error_truncated: bool | None = None
+
+
 def _require_exactly_one_target(address: str | None, name: str | None, operation: str) -> None:
     has_address = address is not None and bool(address.strip())
     has_name = name is not None and bool(name.strip())
@@ -464,6 +589,8 @@ def register_ida_actions(app: FastAPI) -> None:
 
     @app.post(
         "/v1/ida/instances",
+        response_model=ListIdaInstancesResponse,
+        response_model_exclude_unset=True,
         operation_id="listIdaInstances",
         summary="List running IDA plugin instances.",
         description="List live IDA databases registered by the local IDA-Script-MCP plugin.",
@@ -504,6 +631,8 @@ def register_ida_actions(app: FastAPI) -> None:
 
     @app.post(
         "/v1/ida/database-info",
+        response_model=GetIdaDatabaseInfoResponse,
+        response_model_exclude_unset=True,
         operation_id="getIdaDatabaseInfo",
         summary="Get selected IDA database metadata.",
         description=(
@@ -522,6 +651,8 @@ def register_ida_actions(app: FastAPI) -> None:
 
     @app.post(
         "/v1/ida/functions",
+        response_model=ListIdaFunctionsResponse,
+        response_model_exclude_unset=True,
         operation_id="listIdaFunctions",
         summary="List functions from an IDA database.",
         description=(
@@ -558,6 +689,8 @@ def register_ida_actions(app: FastAPI) -> None:
 
     @app.post(
         "/v1/ida/decompile",
+        response_model=DecompileIdaFunctionResponse,
+        response_model_exclude_unset=True,
         operation_id="decompileIdaFunction",
         summary="Decompile a selected IDA function.",
         description=(
@@ -587,6 +720,8 @@ def register_ida_actions(app: FastAPI) -> None:
 
     @app.post(
         "/v1/ida/xrefs",
+        response_model=GetIdaXrefsResponse,
+        response_model_exclude_unset=True,
         operation_id="getIdaXrefs",
         summary="Get IDA cross references.",
         description=(
@@ -641,6 +776,8 @@ def register_ida_actions(app: FastAPI) -> None:
 
     @app.post(
         "/v1/ida/execute",
+        response_model=ExecuteIdapythonResponse,
+        response_model_exclude_unset=True,
         operation_id="executeIdapython",
         summary="Execute IDAPython in IDA.",
         description=(
