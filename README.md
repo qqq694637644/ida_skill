@@ -222,7 +222,7 @@ Copy `.env.example` to `.env` and replace the placeholders:
 
 ```dotenv
 SKILL_TEMPLE_SERVER_URL=https://gptaction.casacam.net/skills
-SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-mcp-main/src/ida_script_mcp/resources
+SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-gptaction-version/src/ida_script_mcp/resources
 SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
 IDA_SCRIPT_MCP_HOST=127.0.0.1
 # IDA_SCRIPT_MCP_PORT=13338
@@ -242,7 +242,7 @@ Authorization: Bearer <token>
 
 ```powershell
 git submodule update --init --recursive
-py -3 -m pip install -e external/ida-script-mcp-main
+py -3 -m pip install -e external/ida-script-gptaction-version
 py -3 -m pip install -e .[dev]
 skill-temple --host 127.0.0.1 --port 8001
 ```
