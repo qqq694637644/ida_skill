@@ -15,20 +15,25 @@ from __future__ import annotations
 
 import argparse
 import copy
+import secrets
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .ida_actions import register_ida_actions
 from .runtime import (
+    DEFAULT_MAX_SKILLS,
     SkillNotFoundError,
     SkillPathError,
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+
+BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
 
 
 class StrictRequest(BaseModel):
@@ -40,8 +45,7 @@ class ResolveSkillRequest(StrictRequest):
     hinted_skill_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional explicit skill hints, for example ['idapython'] "
-            "when user writes @idapython."
+            "Explicit skill selection handles, for example ['idapython']."
         ),
     )
     max_results: int = Field(default=3, ge=1, le=10)
@@ -52,21 +56,22 @@ class RetrieveSkillContextRequest(StrictRequest):
     hinted_skill_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional explicit skill hints, for example ['idapython'] "
-            "when user writes @idapython."
+            "Explicit skill selection handles chosen from available_skills."
         ),
     )
-    max_docs: int = Field(default=6, ge=1, le=20)
     allow_skill_chaining: bool = Field(
         default=False,
-        description="Allow multiple cooperating skills in one retrieval result.",
+        description=(
+            "Backward-compatible hint. Multiple explicit selections are always loaded "
+            "together when within the response limit."
+        ),
     )
 
 
 class ConsoleRetrieveRequest(RetrieveSkillContextRequest):
     include_debug: bool = Field(
         default=False,
-        description="Return diagnostic fields such as manifest summaries and raw retrieved docs.",
+        description="Return hidden routing diagnostics for the development console.",
     )
 
 
@@ -87,7 +92,7 @@ class ReadSkillContentRequest(StrictRequest):
         description="Safe relative path inside the skill, for example docs/ida_hexrays.md.",
     )
     start_line: int = Field(default=1, ge=1)
-    max_lines: int = Field(default=200, ge=1, le=2000)
+    max_lines: int = Field(default=2000, ge=1, le=5000)
 
 
 class ErrorDetail(BaseModel):
@@ -100,55 +105,55 @@ class StructuredErrorResponse(BaseModel):
     error: ErrorDetail
 
 
-class EvidenceItem(BaseModel):
-    path: str
-    section: str | None = None
-    why_relevant: str
-
-
-class ResponseContract(BaseModel):
-    expected_output: str
-    must_include: list[str]
-    preferred_modules_or_topics: list[str] = Field(default_factory=list)
-    must_avoid: list[str] = Field(default_factory=list)
-
-
-class ValidationGuidance(BaseModel):
-    can_validate: bool
-    suggested_checks: list[str] = Field(default_factory=list)
-    failure_behavior: list[str] = Field(default_factory=list)
-
-
 class SelectedSkillPacket(BaseModel):
     skill_id: str
+    name: str
+    description: str
     role: Literal["primary", "secondary"]
-    confidence: float
-    capability_tags: list[str] = Field(default_factory=list)
-    operating_rules: list[str] = Field(default_factory=list)
-    response_contract: ResponseContract
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    validation_guidance: ValidationGuidance
-
-
-class RetrievalBudget(BaseModel):
-    max_docs: int
-    max_chars: int
-    used_docs: int
+    source_path: str
+    instructions: str
+    content_hash: str
+    total_lines: int
     truncated: bool
+    next_start_line: int | None = None
+    referenced_paths: list[str] = Field(default_factory=list)
+
+
+class AvailableSkillMetadata(BaseModel):
+    skill_id: str = Field(..., description="Selection handle used in hinted_skill_ids.")
+    name: str
+    description: str
+    description_truncated: bool = False
+    entrypoint: str
+    content_hash: str
 
 
 class Decision(BaseModel):
-    ready: bool
-    next_action: Literal["answer", "searchSkillDocs"]
+    selected: bool
+    next_action: Literal[
+        "followSkillInstructions",
+        "readSkillContent",
+        "selectSkillOrAnswer",
+        "retryWithFewerSkills",
+        "answerWithoutSkill",
+    ]
     reason: str
-    stop: bool
+    stop_retrieval: bool
 
 
 class RetrieveSkillContextResponse(BaseModel):
     selected_skills: list[SelectedSkillPacket] = Field(default_factory=list)
-    retrieval_budget: RetrievalBudget
+    available_skills: list[AvailableSkillMetadata] = Field(default_factory=list)
+    available_skill_count: int
+    included_skill_count: int
+    omitted_skill_count: int
+    descriptions_truncated: bool
+    catalog_char_limit: int
+    catalog_included: bool
+    explicit_skill_ids: list[str] = Field(default_factory=list)
+    unknown_skill_mentions: list[str] = Field(default_factory=list)
+    omitted_explicit_skill_ids: list[str] = Field(default_factory=list)
     decision: Decision
-    fallback_queries: list[str] | None = None
 
 
 class SearchMatch(BaseModel):
@@ -175,6 +180,7 @@ class SearchSkillDocsResponse(BaseModel):
     mode: str
     engine: str
     matches: list[SearchMatch] = Field(default_factory=list)
+    recommended_next_action: Literal["readSkillContent", "none"]
 
 
 class ReadSkillContentResponse(BaseModel):
@@ -186,6 +192,7 @@ class ReadSkillContentResponse(BaseModel):
     content: str
     content_hash: str
     truncated: bool
+    next_start_line: int | None = None
 
 
 def _normalize_server_url(server_url: str | None) -> str | None:
@@ -221,23 +228,90 @@ def _request_server_url(request: Request) -> str:
     return _normalize_server_url(str(request.base_url)) or ""
 
 
+def _normalize_bearer_token(token: str | None) -> str | None:
+    if token is None:
+        return None
+    normalized = token.strip()
+    return normalized or None
+
+
+def _requires_bearer_auth(path: str) -> bool:
+    return path.startswith("/v1/") or path == "/console/retrieve"
+
+
+def _valid_bearer_authorization(authorization: str | None, expected_token: str) -> bool:
+    if not authorization:
+        return False
+    scheme, separator, value = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return False
+    return secrets.compare_digest(value.strip(), expected_token)
+
+
+def _add_bearer_auth_security(schema: dict[str, Any]) -> dict[str, Any]:
+    components = schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes["BearerAuth"] = {"type": "http", "scheme": "bearer"}
+
+    for path, path_item in schema.get("paths", {}).items():
+        if not _requires_bearer_auth(path):
+            continue
+        for operation in path_item.values():
+            if isinstance(operation, dict):
+                operation.setdefault("security", [{"BearerAuth": []}])
+    return schema
+
+
 def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
         server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
+    )
+    bearer_token = _normalize_bearer_token(
+        env_value_from_environment_or_dotenv(BEARER_TOKEN_ENV_VAR)
     )
 
     app = FastAPI(
         title="Skill Temple Gateway",
         version="0.1.0",
         description=(
-            "A local Skill Runtime gateway for Custom GPT Actions. It retrieves compact "
-            "skill manifest rules and relevant documentation snippets without requiring "
-            "Custom GPT Knowledge to unpack or index skill archives."
+            "Codex-style model-driven skill selection adapted to Custom GPT Actions. "
+            "The model chooses from a bounded catalog, then the gateway loads explicit "
+            "SKILL.md entrypoints and supports progressive disclosure."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
     )
+
+    original_openapi = app.openapi
+
+    def openapi_with_optional_bearer_auth() -> dict[str, Any]:
+        schema = original_openapi()
+        if bearer_token:
+            _add_bearer_auth_security(schema)
+        return schema
+
+    app.openapi = openapi_with_optional_bearer_auth  # type: ignore[method-assign]
+
+    @app.middleware("http")
+    async def bearer_auth_middleware(request: Request, call_next: Any) -> Any:
+        if bearer_token and _requires_bearer_auth(request.url.path):
+            if not _valid_bearer_authorization(
+                request.headers.get("authorization"),
+                bearer_token,
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "unauthorized",
+                            "message": "Missing or invalid Bearer token.",
+                            "suggested_next_action": "configure_bearer_auth",
+                        }
+                    },
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
 
     def structured_error(
         code: str,
@@ -259,8 +333,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         return runtime.retrieve(
             query=request.query,
             hinted_skill_ids=request.hinted_skill_ids,
-            max_skills=3 if request.allow_skill_chaining else 1,
-            max_docs=request.max_docs,
+            max_skills=DEFAULT_MAX_SKILLS,
             allow_skill_chaining=request.allow_skill_chaining,
             include_debug=include_debug,
         )
@@ -297,10 +370,11 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
     @app.post(
         "/v1/skills/resolve",
         operation_id="resolveSkill",
-        summary="Resolve which skill best matches a user task.",
+        summary="Resolve exact skill hints or mentions.",
         description=(
-            "Ranks available skills for a task. This is useful for diagnostics; "
-            "retrieveSkillContext already performs resolution internally."
+            "Diagnostic endpoint for exact hinted_skill_ids, Codex-style $skill mentions, "
+            "and the gateway's @skill extension. "
+            "It does not perform semantic description ranking."
         ),
         include_in_schema=False,
     )
@@ -329,14 +403,10 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         response_model=RetrieveSkillContextResponse,
         response_model_exclude_none=True,
         responses={404: {"model": StructuredErrorResponse}},
-        summary=(
-            "Retrieve the best matching skill rules and relevant documentation "
-            "for a user task."
-        ),
+        summary="Discover or load explicitly selected skills.",
         description=(
-            "Default first Action call for skill-backed tasks, including hints such as "
-            "@idapython. Selects relevant skills, returns compact rules and documentation "
-            "snippets, and reports whether follow-up search or file reads are needed."
+            "Return a bounded skill catalog, or load exact hinted skills and explicit "
+            "$skill mentions. @skill is also supported as a gateway extension."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -356,8 +426,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Search documentation for a specific skill.",
         description=(
-            "Use after retrieveSkillContext when more specific documentation is needed, "
-            "or when the user asks about exact APIs, constants, classes, or edge behavior."
+            "Search indexed resources within one selected skill."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -388,8 +457,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
         responses={404: {"model": StructuredErrorResponse}},
         summary="Read a skill file by safe relative path.",
         description=(
-            "Use for precise follow-up reads when retrieveSkillContext or searchSkillDocs "
-            "identifies a specific file path. Paths are constrained to the selected skill root."
+            "Read an exact safe relative path within one selected skill."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
@@ -410,6 +478,8 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
 
+    register_ida_actions(app)
+
     return app
 
 
@@ -422,7 +492,7 @@ CONSOLE_HTML = """<!doctype html>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 980px; }
     label { display: block; font-weight: 600; margin-top: 1rem; }
-    input[type="text"], input[type="number"], textarea {
+    input[type="password"], input[type="text"], input[type="number"], select, textarea {
       width: 100%; box-sizing: border-box; padding: .55rem; font: inherit;
     }
     textarea { min-height: 7rem; }
@@ -430,6 +500,10 @@ CONSOLE_HTML = """<!doctype html>
     pre { background: #111827; color: #e5e7eb; padding: 1rem; overflow: auto; }
     .row { display: flex; gap: 1rem; align-items: center; }
     .row label { font-weight: 400; margin-top: .75rem; }
+    .actions { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; }
+    .muted { color: #6b7280; }
+    .panel { border-top: 1px solid #e5e7eb; margin-top: 1.5rem; padding-top: 1rem; }
+    #api_log { min-height: 12rem; white-space: pre-wrap; }
   </style>
 </head>
 <body>
@@ -438,42 +512,268 @@ CONSOLE_HTML = """<!doctype html>
     This development console is hidden from the GPT Action OpenAPI schema
     and may request debug output.
   </p>
+
+  <section class="panel">
+    <h2>Bearer Token</h2>
+    <p class="muted">
+      Optional. Stored only in this browser tab session and redacted in the trace log.
+    </p>
+    <label for="bearer_token">Authorization token</label>
+    <input id="bearer_token" type="password" autocomplete="off"
+      placeholder="Bearer token from .env" />
+    <div class="actions">
+      <button id="save_token" type="button">Save token to sessionStorage</button>
+      <button id="clear_token" type="button">Clear token</button>
+      <span id="token_state" class="muted">No token saved.</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Quick retrieveSkillContext debug call</h2>
   <label for="query">Query</label>
   <textarea id="query">@idapython write a script to find xrefs to strcpy</textarea>
   <label for="hints">Hinted skill ids, comma-separated</label>
   <input id="hints" type="text" value="idapython" />
-  <label for="max_docs">Max docs</label>
-  <input id="max_docs" type="number" min="1" max="20" value="6" />
   <div class="row">
     <label><input id="allow_chain" type="checkbox" /> Allow skill chaining</label>
     <label><input id="include_debug" type="checkbox" checked /> Include debug</label>
   </div>
   <button id="run">Retrieve</button>
+  </section>
+
+  <section class="panel">
+    <h2>Manual GPT Action call</h2>
+    <label for="operation">Operation</label>
+    <select id="operation"></select>
+    <label for="operation_body">JSON body</label>
+    <textarea id="operation_body"></textarea>
+    <button id="run_operation" type="button">Run Operation</button>
+  </section>
+
   <h2>Result</h2>
   <pre id="result">Ready.</pre>
+
+  <section class="panel">
+    <div class="actions">
+      <h2>API Call Timeline</h2>
+      <button id="clear_log" type="button">Clear Timeline</button>
+    </div>
+    <pre id="api_log">Ready.</pre>
+  </section>
+
   <script>
     const result = document.getElementById('result');
+    const apiLog = document.getElementById('api_log');
+    const tokenInput = document.getElementById('bearer_token');
+    const tokenState = document.getElementById('token_state');
+    const operationSelect = document.getElementById('operation');
+    const operationBody = document.getElementById('operation_body');
+    const TOKEN_KEY = 'skill_temple_console_bearer_token';
+
+    const operations = {
+      retrieveSkillContext: {
+        method: 'POST',
+        url: '/v1/skills/retrieve',
+        body: {
+          query: '@idapython write a script to find xrefs to strcpy',
+          hinted_skill_ids: ['idapython'],
+          allow_skill_chaining: false
+        }
+      },
+      searchSkillDocs: {
+        method: 'POST',
+        url: '/v1/skills/search',
+        body: {skill_id: 'idapython', query: 'ctree_visitor_t cot_call', limit: 5}
+      },
+      readSkillContent: {
+        method: 'POST',
+        url: '/v1/skills/read',
+        body: {skill_id: 'idapython', path: 'SKILL.md', start_line: 1, max_lines: 80}
+      },
+      listIdaInstances: {method: 'POST', url: '/v1/ida/instances', body: {}},
+      getIdaDatabaseInfo: {method: 'POST', url: '/v1/ida/database-info', body: {}},
+      listIdaFunctions: {
+        method: 'POST',
+        url: '/v1/ida/functions',
+        body: {offset: 0, limit: 50}
+      },
+      decompileIdaFunction: {
+        method: 'POST',
+        url: '/v1/ida/decompile',
+        body: {name: 'main', include_disassembly: false}
+      },
+      getIdaXrefs: {
+        method: 'POST',
+        url: '/v1/ida/xrefs',
+        body: {name: 'main', direction: 'to', xref_kind: 'all', limit: 100}
+      },
+      executeIdapython: {
+        method: 'POST',
+        url: '/v1/ida/execute',
+        body: {
+          code: 'import idaapi\nresult = {"imagebase": hex(idaapi.get_imagebase())}',
+          capture_output: true,
+          timeout_seconds: 30
+        }
+      }
+    };
+
+    for (const name of Object.keys(operations)) {
+      const option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      operationSelect.appendChild(option);
+    }
+
+    function updateOperationBody() {
+      const operation = operations[operationSelect.value];
+      operationBody.value = JSON.stringify(operation.body, null, 2);
+    }
+
+    function setTokenState() {
+      tokenState.textContent = sessionStorage.getItem(TOKEN_KEY)
+        ? 'Token saved.'
+        : 'No token saved.';
+    }
+
+    function nowStamp() {
+      const now = new Date();
+      return now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
+    }
+
+    function appendLog(title, payload) {
+      if (apiLog.textContent === 'Ready.') {
+        apiLog.textContent = '';
+      }
+      const rendered = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+      apiLog.textContent += `[${nowStamp()}] ${title}\n${rendered}\n\n`;
+      apiLog.scrollTop = apiLog.scrollHeight;
+    }
+
+    function getHeaders() {
+      const token = sessionStorage.getItem(TOKEN_KEY);
+      const headers = {'Content-Type': 'application/json'};
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      return headers;
+    }
+
+    function redactHeaders(headers) {
+      const redacted = {...headers};
+      if (redacted.Authorization) {
+        redacted.Authorization = 'Bearer ***redacted***';
+      }
+      return redacted;
+    }
+
+    async function apiCall({label, method, url, body}) {
+      const headers = getHeaders();
+      const started = performance.now();
+      appendLog(`${label}: request start`, {method, url, headers: redactHeaders(headers), body});
+      result.textContent = 'Loading...';
+      try {
+        appendLog(`${label}: waiting response`, 'fetch() in progress...');
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: JSON.stringify(body)
+        });
+        const durationMs = Math.round(performance.now() - started);
+        const responseHeaders = Object.fromEntries(response.headers.entries());
+        const contentType = response.headers.get('content-type') || '';
+        appendLog(`${label}: response received`, {
+          status: response.status,
+          statusText: response.statusText,
+          contentType,
+          durationMs
+        });
+        appendLog(`${label}: response headers`, responseHeaders);
+        const text = await response.text();
+        try {
+          const data = text ? JSON.parse(text) : null;
+          appendLog(`${label}: parsed json`, data);
+          result.textContent = JSON.stringify(data, null, 2);
+          return data;
+        } catch (parseError) {
+          const diagnostic = {
+            error: String(parseError),
+            status: response.status,
+            contentType,
+            rawText: text
+          };
+          appendLog(`${label}: non-json response`, diagnostic);
+          result.textContent = JSON.stringify(diagnostic, null, 2);
+          return diagnostic;
+        }
+      } catch (error) {
+        const durationMs = Math.round(performance.now() - started);
+        const diagnostic = {error: String(error), durationMs};
+        appendLog(`${label}: request failed`, diagnostic);
+        result.textContent = JSON.stringify(diagnostic, null, 2);
+        return diagnostic;
+      }
+    }
+
+    tokenInput.value = sessionStorage.getItem(TOKEN_KEY) || '';
+    setTokenState();
+    updateOperationBody();
+
+    document.getElementById('save_token').addEventListener('click', () => {
+      const token = tokenInput.value.trim();
+      if (token) {
+        sessionStorage.setItem(TOKEN_KEY, token);
+      } else {
+        sessionStorage.removeItem(TOKEN_KEY);
+      }
+      setTokenState();
+      appendLog('Bearer token updated', {Authorization: token ? 'Bearer ***redacted***' : null});
+    });
+
+    document.getElementById('clear_token').addEventListener('click', () => {
+      tokenInput.value = '';
+      sessionStorage.removeItem(TOKEN_KEY);
+      setTokenState();
+      appendLog('Bearer token cleared', {Authorization: null});
+    });
+
+    document.getElementById('clear_log').addEventListener('click', () => {
+      apiLog.textContent = 'Ready.';
+    });
+
+    operationSelect.addEventListener('change', updateOperationBody);
+
     document.getElementById('run').addEventListener('click', async () => {
       const hinted = document.getElementById('hints').value
         .split(',').map(v => v.trim()).filter(Boolean);
       const body = {
         query: document.getElementById('query').value,
         hinted_skill_ids: hinted,
-        max_docs: Number(document.getElementById('max_docs').value || 6),
         allow_skill_chaining: document.getElementById('allow_chain').checked,
         include_debug: document.getElementById('include_debug').checked
       };
-      result.textContent = 'Loading...';
+      await apiCall({
+        label: 'consoleRetrieve',
+        method: 'POST',
+        url: '/console/retrieve',
+        body
+      });
+    });
+
+    document.getElementById('run_operation').addEventListener('click', async () => {
+      const operation = operations[operationSelect.value];
       try {
-        const response = await fetch('/console/retrieve', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(body)
+        const body = JSON.parse(operationBody.value || '{}');
+        await apiCall({
+          label: operationSelect.value,
+          method: operation.method,
+          url: operation.url,
+          body
         });
-        const data = await response.json();
-        result.textContent = JSON.stringify(data, null, 2);
       } catch (error) {
-        result.textContent = String(error);
+        const diagnostic = {error: String(error), rawText: operationBody.value};
+        appendLog(`${operationSelect.value}: invalid request JSON`, diagnostic);
+        result.textContent = JSON.stringify(diagnostic, null, 2);
       }
     });
   </script>
