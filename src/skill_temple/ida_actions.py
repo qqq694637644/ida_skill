@@ -17,7 +17,7 @@ from typing import Any, Literal
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-IDA_SETUP_HINT = "Run: py -3 -m pip install -e external/ida-script-mcp-main"
+IDA_SETUP_HINT = "Run: py -3 -m pip install -e external/ida-script-gptaction-version"
 IDA_ERROR_HINT = (
     "Make sure IDA Pro is running with the IDA-Script-MCP plugin started. "
     "In IDA, use Edit -> Plugins -> IDA-Script-MCP (Ctrl+Alt+S)."

@@ -272,7 +272,7 @@ def test_ida_action_endpoints_report_missing_dependency(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["error"] == "ida_script_mcp is not installed"
-    assert "external/ida-script-mcp-main" in response.json()["hint"]
+    assert "external/ida-script-gptaction-version" in response.json()["hint"]
 
 
 def test_execute_idapython_reports_plugin_response_timeout(monkeypatch) -> None:
@@ -523,6 +523,6 @@ def test_decompile_and_xrefs_require_one_target(monkeypatch) -> None:
 def test_ida_script_mcp_submodule_is_recorded() -> None:
     gitmodules = Path(".gitmodules").read_text(encoding="utf-8")
 
-    assert "external/ida-script-mcp-main" in gitmodules
-    assert "https://github.com/qqq694637644/ida-script-mcp-main" in gitmodules
+    assert "external/ida-script-gptaction-version" in gitmodules
+    assert "https://github.com/qqq694637644/ida-script-gptaction-version" in gitmodules
     assert "branch =" not in gitmodules

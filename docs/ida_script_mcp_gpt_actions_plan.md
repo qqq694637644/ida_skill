@@ -2,7 +2,7 @@
 
 ## Goal
 
-Integrate `qqq694637644/ida-script-mcp-main` into `ida_skill` so a Custom GPT can use one GPT Action schema for both:
+Integrate `qqq694637644/ida-script-gptaction-version` into `ida_skill` so a Custom GPT can use one GPT Action schema for both:
 
 1. Skill Temple documentation retrieval.
 2. Live IDA Pro analysis and IDAPython execution through the existing IDA Script MCP plugin.
@@ -21,22 +21,22 @@ The IDA plugin must still stay bound to localhost or another trusted private add
 
 ### Use a Git submodule, do not copy the project
 
-Add `ida-script-mcp-main` as a submodule inside `ida_skill`:
+Add `ida-script-gptaction-version` as a submodule inside `ida_skill`:
 
 ```powershell
-git submodule add https://github.com/qqq694637644/ida-script-mcp-main external/ida-script-mcp-main
+git submodule add https://github.com/qqq694637644/ida-script-gptaction-version external/ida-script-gptaction-version
 git submodule update --init --recursive
 ```
 
 Recommended path:
 
 ```text
-external/ida-script-mcp-main
+external/ida-script-gptaction-version
 ```
 
 Reasons:
 
-- Keep `ida-script-mcp-main` history and updates independent.
+- Keep `ida-script-gptaction-version` history and updates independent.
 - Avoid duplicating the IDA plugin, protocol models, installer, and packaged IDAPython docs.
 - Allow `ida_skill` to focus on the GPT Actions HTTP gateway.
 - Pin the submodule commit in `ida_skill` so deployments are reproducible.
@@ -73,7 +73,7 @@ After adding the submodule, install it editable in the same Python environment u
 ```powershell
 cd C:\Users\Administrator\Desktop\ida_skill
 py -3 -m pip install -e .[dev]
-py -3 -m pip install -e external/ida-script-mcp-main
+py -3 -m pip install -e external/ida-script-gptaction-version
 ```
 
 The GPT gateway should import `ida_script_mcp.server` lazily. If it is missing, return a structured setup error such as:
@@ -81,7 +81,7 @@ The GPT gateway should import `ida_script_mcp.server` lazily. If it is missing, 
 ```json
 {
   "error": "ida_script_mcp is not installed",
-  "hint": "Run: py -3 -m pip install -e external/ida-script-mcp-main"
+  "hint": "Run: py -3 -m pip install -e external/ida-script-gptaction-version"
 }
 ```
 
@@ -94,7 +94,7 @@ Do not copy the IDAPython docs into `ida_skill`.
 Use the submodule package resources as the skills directory:
 
 ```env
-SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-mcp-main/src/ida_script_mcp/resources
+SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-gptaction-version/src/ida_script_mcp/resources
 ```
 
 That directory contains the `idapython/` skill folder and avoids pointing Skill Temple at the full submodule root, which also contains non-skill folders such as `src/` and `tests/`.
@@ -127,7 +127,7 @@ Use this `.env` in the `ida_skill` working directory when Caddy, the FastAPI gat
 
 ```env
 SKILL_TEMPLE_SERVER_URL=https://gptaction.casacam.net/skills
-SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-mcp-main/src/ida_script_mcp/resources
+SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-script-gptaction-version/src/ida_script_mcp/resources
 IDA_SCRIPT_MCP_HOST=127.0.0.1
 ```
 
@@ -288,7 +288,7 @@ Use `dict[str, Any]` response payloads at first instead of large nested response
 
 Reasons:
 
-- `ida-script-mcp-main` already defines and tests the transport payloads.
+- `ida-script-gptaction-version` already defines and tests the transport payloads.
 - IDA plugin responses contain many fields that may evolve.
 - GPT Actions can handle object responses well as long as the request schema is strict and descriptions are concise.
 
@@ -309,14 +309,14 @@ Later, add typed response models only for fields GPT frequently needs, such as:
 
 ### Phase 1: Submodule and docs
 
-1. Add `.gitmodules` and submodule at `external/ida-script-mcp-main`.
+1. Add `.gitmodules` and submodule at `external/ida-script-gptaction-version`.
 2. Document install command:
    ```powershell
-   py -3 -m pip install -e external/ida-script-mcp-main
+   py -3 -m pip install -e external/ida-script-gptaction-version
    ```
 3. Point `SKILL_TEMPLE_SKILLS_DIR` to:
    ```text
-   external/ida-script-mcp-main/src/ida_script_mcp/resources
+   external/ida-script-gptaction-version/src/ida_script_mcp/resources
    ```
 4. Confirm Skill Temple can load `idapython` from the submodule resources.
 5. Keep the submodule pinned to a commit where `idapython/SKILL.md` is the only entrypoint and directly routes to task-specific docs.
@@ -411,7 +411,7 @@ Because this is personal-use automation, all operations are marked non-consequen
 | Submodule package not installed. | Lazy import and structured setup error with install command. |
 | GPT Action import rejects schema. | Keep descriptions <= 300 chars and every operation has `x-openai-isConsequential: false`. |
 | Caddy prefix mismatch. | Set `SKILL_TEMPLE_SERVER_URL=https://gptaction.casacam.net/skills`; keep FastAPI internal paths unprefixed. |
-| Full submodule root is not a valid skills directory. | Use `external/ida-script-mcp-main/src/ida_script_mcp/resources` as `SKILL_TEMPLE_SKILLS_DIR`. |
+| Full submodule root is not a valid skills directory. | Use `external/ida-script-gptaction-version/src/ida_script_mcp/resources` as `SKILL_TEMPLE_SKILLS_DIR`. |
 | `idapython/SKILL.md` or a directly referenced doc goes missing upstream. | Pin the submodule to a tested commit and validate every referenced relative path. |
 | Blocking IDA plugin calls freeze the event loop. | Use sync FastAPI handlers or `anyio.to_thread.run_sync`; do not directly await blocking wrappers. |
 | Gateway and IDA run on different machines. | `IDA_SCRIPT_MCP_HOST=127.0.0.1` only works when both run on the same host; otherwise use a private reachable host. |
@@ -420,8 +420,8 @@ Because this is personal-use automation, all operations are marked non-consequen
 
 The integration is ready when:
 
-1. `git submodule update --init --recursive` restores `external/ida-script-mcp-main`.
-2. `py -3 -m pip install -e external/ida-script-mcp-main` makes `ida_script_mcp` importable.
+1. `git submodule update --init --recursive` restores `external/ida-script-gptaction-version`.
+2. `py -3 -m pip install -e external/ida-script-gptaction-version` makes `ida_script_mcp` importable.
 3. `skill-temple` loads `idapython` from the submodule resources.
 4. `idapython` loads from `SKILL.md` frontmatter without `skill.json` or `INDEX.md`.
 5. `/openapi.json` imports into Custom GPT Actions without schema errors.
