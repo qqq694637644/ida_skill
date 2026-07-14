@@ -75,6 +75,12 @@ The public OpenAPI schema exposes:
 | `decompileIdaFunction` | `POST` | `/v1/ida/decompile` | Decompile a function by name or address. |
 | `getIdaXrefs` | `POST` | `/v1/ida/xrefs` | Read incoming or outgoing cross-references. |
 | `executeIdapython` | `POST` | `/v1/ida/execute` | Execute custom IDAPython in the selected IDA instance. |
+| `workspaceCommand` | `POST` | `/v1/workspace/command` | Start or manage asynchronous PowerShell 7 commands in `WORKSPACE_ROOT`. |
+| `workspaceInspect` | `POST` | `/v1/workspace/inspect` | Inspect a directory tree, search matches, and related file snippets. |
+| `workspaceSearch` | `POST` | `/v1/workspace/search` | Search text with ripgrep. |
+| `workspaceReadFiles` | `POST` | `/v1/workspace/read-files` | Read multiple UTF-8 files with line numbers and hashes. |
+| `workspaceWriteFile` | `POST` | `/v1/workspace/write-file` | Create or overwrite one UTF-8 text file. |
+| `workspaceApplyPatch` | `POST` | `/v1/workspace/apply-patch` | Apply a Codex `*** Begin Patch` text patch. |
 
 All public operations publish `x-openai-isConsequential: false` for this trusted personal gateway.
 
@@ -162,6 +168,49 @@ When `truncated=true`, continue from `next_start_line` until the selected resour
 
 Use search only when the selected `SKILL.md` does not identify an exact relevant resource. Search uses SQLite FTS5 with symbol, path, heading, and API-name boosts.
 
+## Local workspace tools
+
+The six `/v1/workspace/*` Actions are a local-folder port of the corresponding
+`github-gpt-actions-gateway` workspace tools. They do not clone repositories or use
+branches, commits, pushes, PRs, or CI. Every operation uses the single folder configured
+by `WORKSPACE_ROOT`.
+
+`workspaceInspect`, `workspaceSearch`, and `workspaceReadFiles` retain the gateway's
+bounded response, line-number, hash, context, and truncation behavior. Search and inspect
+require `rg` on `PATH`.
+
+`workspaceWriteFile` supports `create_only`, `overwrite`, and
+`overwrite_if_sha256_matches`, plus UTF-8 line-ending conversion and `dry_run`.
+`workspaceApplyPatch` accepts the gateway/Codex patch format:
+
+```text
+*** Begin Patch
+*** Update File: notes.txt
+@@
+-old
++new
+*** Add File: added.txt
++content
+*** End Patch
+```
+
+Deletion requires `allow_delete=true`. Patch failures restore all touched files, and
+`dry_run=true` returns the calculated changes before restoring the original content.
+
+`workspaceCommand` keeps the source gateway's asynchronous lifecycle:
+
+```text
+start -> get / logs -> terminal state
+                   -> cancel
+list
+```
+
+`start` requires a unique `idempotency_key` and a PowerShell script. The command runs
+with PowerShell 7 in `WORKSPACE_ROOT`. State and logs are stored outside the target folder
+under `WORKSPACE_OPERATION_ROOT` or `.runtime/workspace-operations`. `logs` supports
+independent stdout/stderr byte offsets. Terminal states are `succeeded`, `failed`,
+`timed_out`, `canceled`, and `interrupted`.
+
 ## Multiple skills
 
 Multiple exact hints or explicit mentions automatically load together; callers do not
@@ -226,6 +275,10 @@ SKILL_TEMPLE_SKILLS_DIR=C:/Users/Administrator/Desktop/ida_skill/external/ida-sc
 SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
 IDA_SCRIPT_MCP_HOST=127.0.0.1
 # IDA_SCRIPT_MCP_PORT=13338
+WORKSPACE_ROOT=C:/path/to/workspace
+WORKSPACE_PWSH_PATH=pwsh
+# WORKSPACE_OPERATION_ROOT=C:/path/to/ida_skill/.runtime/workspace-operations
+# WORKSPACE_ALLOW_NETWORK=false
 ```
 
 `.env` is ignored by Git. Only `.env.example` is tracked.

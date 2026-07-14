@@ -597,6 +597,12 @@ class RuntimeTests(unittest.TestCase):
                 "decompileIdaFunction",
                 "getIdaXrefs",
                 "executeIdapython",
+                "workspaceCommand",
+                "workspaceInspect",
+                "workspaceSearch",
+                "workspaceReadFiles",
+                "workspaceWriteFile",
+                "workspaceApplyPatch",
             },
         )
         for path, path_item in schema["paths"].items():
