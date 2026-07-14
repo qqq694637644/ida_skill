@@ -247,6 +247,20 @@ py -3 -m pip install -e .[dev]
 skill-temple --host 127.0.0.1 --port 8001
 ```
 
+### Install the IDA plugin with IDA 8.3's bundled Python
+
+When IDA 8.3 is installed at `C:\Users\Administrator\Desktop\ida 8.3` and this repository is located at `C:\Users\Administrator\Desktop\ida_skill`, run the following commands in PowerShell:
+
+```powershell
+& "C:\Users\Administrator\Desktop\ida 8.3\python311\python.exe" `
+  -m pip install -e "C:\Users\Administrator\Desktop\ida_skill\external\ida-script-gptaction-version"
+
+& "C:\Users\Administrator\Desktop\ida 8.3\python311\python.exe" `
+  -m ida_script_mcp.installer install
+```
+
+Restart IDA after installation. Open an IDB, then start the plugin from `Edit -> Plugins -> IDA-Script-MCP` or press `Ctrl+Alt+S`.
+
 The submodule resource directory contains the production `idapython/SKILL.md` and its progressively disclosed docs.
 
 OpenAPI:
