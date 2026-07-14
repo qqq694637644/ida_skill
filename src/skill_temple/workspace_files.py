@@ -456,18 +456,17 @@ class LocalWorkspaceService:
             output_lines: list[str] = []
             output_bytes = 0
             truncated = start_idx + len(selected) < len(lines)
+            next_start_line: int | None = start_line + len(selected) if truncated else None
             for offset, line in enumerate(selected, start=start_line):
                 rendered = f"{offset}: {line}"
                 rendered_bytes = len((rendered + "\n").encode("utf-8"))
                 if rendered_bytes > max_bytes:
-                    clipped, _ = _clip_text_to_bytes(rendered, max_bytes)
-                    if clipped:
-                        output_lines.append(clipped)
-                        output_bytes += len(clipped.encode("utf-8"))
                     truncated = True
+                    next_start_line = offset
                     break
                 if output_bytes + rendered_bytes > max_bytes:
                     truncated = True
+                    next_start_line = offset
                     break
                 output_lines.append(rendered)
                 output_bytes += rendered_bytes
@@ -483,11 +482,7 @@ class LocalWorkspaceService:
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "content": content,
                 "truncated": truncated or content_truncated,
-                "next_start_line": (
-                    (end_line + 1 if end_line is not None else start_line)
-                    if truncated or content_truncated
-                    else None
-                ),
+                "next_start_line": next_start_line if truncated or content_truncated else None,
                 "error": None,
             }
         except Exception as exc:
@@ -673,6 +668,7 @@ def _fit_read_files_response(response: dict[str, Any], max_bytes: int) -> dict[s
         if last["content"]:
             last["content"] = ""
             last["truncated"] = True
+            last["next_start_line"] = last["start_line"]
         else:
             response["files"].pop()
         response["truncated"] = True
@@ -712,6 +708,7 @@ def _fit_inspect_response(response: dict[str, Any], max_bytes: int) -> dict[str,
             if last["content"]:
                 last["content"] = ""
                 last["truncated"] = True
+                last["next_start_line"] = last["start_line"]
             else:
                 response["files"].pop()
             response["truncated"] = True

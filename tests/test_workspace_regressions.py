@@ -15,9 +15,18 @@ from fastapi.testclient import TestClient
 
 import skill_temple.workspace_operations as operations_module
 from skill_temple.app import create_app
-from skill_temple.workspace_files import _run_bounded_command
+from skill_temple.workspace_files import (
+    LocalWorkspaceService,
+    _fit_read_files_response,
+    _run_bounded_command,
+)
 from skill_temple.workspace_operations import OperationSettings, WorkspaceOperationManager
-from skill_temple.workspace_patch import PreparedFileChange, commit_prepared_changes
+from skill_temple.workspace_patch import (
+    PreparedFileChange,
+    WorkspaceToolError,
+    commit_prepared_changes,
+    describe_changes,
+)
 
 
 def _client(root: Path, operation_root: Path | None = None) -> TestClient:
@@ -164,6 +173,128 @@ def test_prepared_commit_restores_original_when_commit_step_fails() -> None:
         assert target.read_bytes() == b"before\n"
         assert not list(root.glob(".*.stage"))
         assert not list(root.glob(".*.backup"))
+
+
+def test_partial_stage_write_is_registered_and_cleaned() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp) / "workspace"
+        root.mkdir()
+        target = root / "alpha.txt"
+        target.write_bytes(b"before\n")
+        change = PreparedFileChange(
+            path="alpha.txt",
+            resolved_path=target,
+            before=b"before\n",
+            after=b"after\n",
+        )
+        transaction_parent = root.parent / ".ida-skill-workspace-transactions"
+        real_write_bytes = Path.write_bytes
+
+        def partial_then_fail(path: Path, data: bytes) -> int:
+            if path.suffix == ".stage":
+                with path.open("wb") as handle:
+                    handle.write(data[:2])
+                raise OSError("injected stage write failure")
+            return real_write_bytes(path, data)
+
+        with patch.object(Path, "write_bytes", partial_then_fail):
+            with pytest.raises(OSError, match="injected stage write failure"):
+                commit_prepared_changes(root, [change])
+
+        assert target.read_bytes() == b"before\n"
+        assert not transaction_parent.exists()
+
+
+def test_cleanup_failure_rolls_back_committed_change() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp) / "workspace"
+        root.mkdir()
+        target = root / "alpha.txt"
+        target.write_bytes(b"before\n")
+        change = PreparedFileChange(
+            path="alpha.txt",
+            resolved_path=target,
+            before=b"before\n",
+            after=b"after\n",
+        )
+        transaction_parent = root.parent / ".ida-skill-workspace-transactions"
+        real_rmtree = shutil.rmtree
+        calls = 0
+
+        def fail_once(path: str | os.PathLike[str], *args, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError("injected cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with patch("skill_temple.workspace_patch.shutil.rmtree", side_effect=fail_once):
+            with pytest.raises(WorkspaceToolError) as exc:
+                commit_prepared_changes(root, [change])
+
+        assert exc.value.code == "WORKSPACE_TRANSACTION_CLEANUP_FAILED"
+        assert target.read_bytes() == b"before\n"
+        assert not transaction_parent.exists()
+
+
+def test_long_single_line_does_not_advance_continuation() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        (root / "long.txt").write_text("abcdefghij\nsecond\n", encoding="utf-8")
+
+        result = LocalWorkspaceService()._read_file_content(
+            root,
+            "long.txt",
+            start_line=1,
+            max_lines=2,
+            max_bytes=6,
+        )
+
+        assert result["content"] == ""
+        assert result["end_line"] is None
+        assert result["truncated"] is True
+        assert result["next_start_line"] == 1
+
+
+def test_response_budget_truncation_restarts_current_file() -> None:
+    response = {
+        "files": [
+            {
+                "path": "alpha.txt",
+                "start_line": 5,
+                "end_line": 5,
+                "total_lines": 10,
+                "bytes": 5000,
+                "sha256": "0" * 64,
+                "content": "5: " + ("x" * 2000),
+                "truncated": False,
+                "next_start_line": None,
+                "error": None,
+            }
+        ],
+        "truncated": False,
+    }
+
+    fitted = _fit_read_files_response(response, 1024)
+
+    assert fitted["files"][0]["content"] == ""
+    assert fitted["files"][0]["truncated"] is True
+    assert fitted["files"][0]["next_start_line"] == 5
+
+
+def test_newline_only_change_has_nonzero_line_counts() -> None:
+    change = PreparedFileChange(
+        path="script.sh",
+        resolved_path=Path("script.sh"),
+        before=b"echo ok",
+        after=b"echo ok\n",
+    )
+
+    changed, diff_stat = describe_changes([change])
+
+    assert changed[0]["additions"] == 1
+    assert changed[0]["deletions"] == 1
+    assert "+1 -1" in diff_stat
 
 
 def test_read_files_returns_next_start_line_when_truncated() -> None:

@@ -197,7 +197,14 @@ require `rg` on `PATH`.
 Deletion requires `allow_delete=true`. Write and patch dry-runs calculate changes entirely
 in memory and never create, replace, delete, or restore files. A real multi-file patch is
 fully parsed and validated in memory first; new contents are staged before commit, and
-per-file backups are used to roll back a commit error.
+per-file backups are used to roll back commit or cleanup errors. Transaction files live in
+a same-volume sibling runtime directory named `.ida-skill-workspace-transactions`, outside
+`WORKSPACE_ROOT`, so they do not appear in inspect/search results for the target folder.
+
+`changed_files` and `diff_stat` describe this request relative to the file contents present
+when the request started; they are not version-control status. Truncated file reads never
+return a partial line. If one line cannot fit in the per-file byte budget,
+`next_start_line` remains on that line so the caller can retry with a larger budget.
 
 `workspaceCommand` keeps the source gateway's asynchronous lifecycle:
 
