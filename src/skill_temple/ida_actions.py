@@ -251,8 +251,11 @@ class IdaXrefRecord(BaseModel):
     from_name: str | None = None
     to_ea: int | str | None = None
     to_name: str | None = None
-    type: str | None = None
+    type: int | None = None
+    type_name: str | None = None
     is_code: bool | None = None
+    user: bool | None = None
+    source_disassembly: str | None = None
 
 
 class GetIdaXrefsResponse(IdaActionResponse):
