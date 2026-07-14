@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .ida_actions import register_ida_actions
+from .workspace_actions import register_workspace_actions
 from .runtime import (
     DEFAULT_MAX_SKILLS,
     SkillNotFoundError,
@@ -479,6 +480,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             raise HTTPException(status_code=404, detail=detail) from exc
 
     register_ida_actions(app)
+    register_workspace_actions(app)
 
     return app
 
