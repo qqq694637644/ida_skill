@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -39,6 +41,14 @@ class FileSnapshot:
     resolved_path: Path
     existed: bool
     data: bytes | None
+
+
+@dataclass(frozen=True)
+class PreparedFileChange:
+    path: str
+    resolved_path: Path
+    before: bytes | None
+    after: bytes | None
 
 
 def sha256_hex(data: bytes) -> str:
@@ -96,26 +106,6 @@ def snapshot_files(root: Path, paths: list[str]) -> list[FileSnapshot]:
         else:
             snapshots.append(FileSnapshot(path, resolved, False, None))
     return snapshots
-
-
-def restore_files(root: Path, snapshots: list[FileSnapshot]) -> None:
-    for snapshot in snapshots:
-        if snapshot.existed:
-            snapshot.resolved_path.parent.mkdir(parents=True, exist_ok=True)
-            snapshot.resolved_path.write_bytes(snapshot.data or b"")
-        elif snapshot.resolved_path.exists() and snapshot.resolved_path.is_file():
-            snapshot.resolved_path.unlink()
-            _remove_empty_parents(snapshot.resolved_path.parent, root)
-
-
-def _remove_empty_parents(path: Path, stop_at: Path) -> None:
-    current = path
-    while current != stop_at and stop_at in current.parents:
-        try:
-            current.rmdir()
-        except OSError:
-            return
-        current = current.parent
 
 
 def parse_codex_patch(
@@ -218,42 +208,134 @@ def parse_codex_patch(
     return operations
 
 
-def apply_text_patch(root: Path, operations: list[TextPatchOperation]) -> list[str]:
-    changed_paths: list[str] = []
+def prepare_text_patch(
+    root: Path,
+    operations: list[TextPatchOperation],
+    snapshots: list[FileSnapshot],
+) -> list[PreparedFileChange]:
+    current = {snapshot.path: snapshot.data for snapshot in snapshots}
     for operation in operations:
-        file_path = target_path(root, operation.path)
         if operation.kind == "add":
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(
-                _join_lines(operation.add_lines, trailing_newline=bool(operation.add_lines)),
-                encoding="utf-8",
-                newline="",
-            )
+            current[operation.path] = _join_lines(
+                operation.add_lines,
+                trailing_newline=bool(operation.add_lines),
+            ).encode("utf-8")
         elif operation.kind == "delete":
-            file_path.unlink()
+            current[operation.path] = None
         else:
-            original = file_path.read_bytes()
+            original = current[operation.path]
+            if original is None:
+                raise WorkspaceToolError(
+                    "WORKSPACE_PATCH_CONTEXT_MISMATCH",
+                    f"Patch update target no longer exists: {operation.path}",
+                    status_code=409,
+                )
             assert_text_bytes(original, path=operation.path)
-            original_text = original.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            original_text = (
+                original.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            )
             lines, trailing = _split_text_lines(original_text)
             new_lines = _apply_hunks(lines, operation.hunks, operation.path)
-            file_path.write_text(
-                _join_lines(new_lines, trailing_newline=trailing), encoding="utf-8", newline=""
-            )
-        changed_paths.append(operation.path)
-    return changed_paths
+            current[operation.path] = _join_lines(
+                new_lines,
+                trailing_newline=trailing,
+            ).encode("utf-8")
+    return [
+        PreparedFileChange(
+            path=snapshot.path,
+            resolved_path=snapshot.resolved_path,
+            before=snapshot.data,
+            after=current[snapshot.path],
+        )
+        for snapshot in snapshots
+        if snapshot.data != current[snapshot.path]
+    ]
+
+
+def prepare_write_change(
+    *,
+    path: str,
+    resolved_path: Path,
+    before: bytes | None,
+    after: bytes,
+) -> list[PreparedFileChange]:
+    if before == after:
+        return []
+    return [
+        PreparedFileChange(
+            path=path,
+            resolved_path=resolved_path,
+            before=before,
+            after=after,
+        )
+    ]
+
+
+def commit_prepared_changes(root: Path, changes: list[PreparedFileChange]) -> None:
+    staged: dict[str, Path] = {}
+    backups: dict[str, Path] = {}
+    created_dirs: set[Path] = set()
+    committed: list[PreparedFileChange] = []
+    try:
+        for change in changes:
+            created_dirs.update(_missing_parent_dirs(change.resolved_path.parent))
+            change.resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            if change.after is not None:
+                temporary = change.resolved_path.with_name(
+                    f".{change.resolved_path.name}.{secrets.token_hex(8)}.stage"
+                )
+                temporary.write_bytes(change.after)
+                staged[change.path] = temporary
+
+        for change in changes:
+            target = change.resolved_path
+            if change.before is not None:
+                backup = target.with_name(
+                    f".{target.name}.{secrets.token_hex(8)}.backup"
+                )
+                os.replace(target, backup)
+                backups[change.path] = backup
+            committed.append(change)
+            if change.after is not None:
+                temporary = staged[change.path]
+                os.replace(temporary, target)
+                staged.pop(change.path)
+    except Exception:
+        for change in reversed(committed):
+            target = change.resolved_path
+            if target.exists() and target.is_file():
+                target.unlink()
+            backup = backups.get(change.path)
+            if backup is not None and backup.exists():
+                os.replace(backup, target)
+        raise
+    finally:
+        for temporary in staged.values():
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        for backup in backups.values():
+            try:
+                backup.unlink()
+            except FileNotFoundError:
+                pass
+        for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
+            if directory == root:
+                continue
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
 
 
 def describe_changes(
-    root: Path,
-    snapshots: list[FileSnapshot],
+    changes: list[PreparedFileChange],
 ) -> tuple[list[dict[str, object]], str]:
     changed: list[dict[str, object]] = []
-    for snapshot in snapshots:
-        after = snapshot.resolved_path.read_bytes() if snapshot.resolved_path.is_file() else None
-        before = snapshot.data
-        if before == after:
-            continue
+    for change in changes:
+        before = change.before
+        after = change.after
         if before is None:
             operation = "added"
         elif after is None:
@@ -263,7 +345,7 @@ def describe_changes(
         additions, deletions = _line_change_counts(before, after)
         changed.append(
             {
-                "path": snapshot.path,
+                "path": change.path,
                 "operation": operation,
                 "status": None,
                 "previous_path": None,
@@ -282,6 +364,17 @@ def describe_changes(
             f"{sum(int(item['deletions']) for item in changed)} deletion(s)"
         )
     return changed, "\n".join(lines)
+
+
+def _missing_parent_dirs(path: Path) -> set[Path]:
+    missing: set[Path] = set()
+    current = path
+    while not current.exists():
+        missing.add(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    return missing
 
 
 def normalize_line_endings(content: str, *, line_ending: str, previous_bytes: bytes | None) -> str:

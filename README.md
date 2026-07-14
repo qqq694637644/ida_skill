@@ -194,8 +194,10 @@ require `rg` on `PATH`.
 *** End Patch
 ```
 
-Deletion requires `allow_delete=true`. Patch failures restore all touched files, and
-`dry_run=true` returns the calculated changes before restoring the original content.
+Deletion requires `allow_delete=true`. Write and patch dry-runs calculate changes entirely
+in memory and never create, replace, delete, or restore files. A real multi-file patch is
+fully parsed and validated in memory first; new contents are staged before commit, and
+per-file backups are used to roll back a commit error.
 
 `workspaceCommand` keeps the source gateway's asynchronous lifecycle:
 

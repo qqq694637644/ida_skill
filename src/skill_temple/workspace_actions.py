@@ -33,6 +33,7 @@ class WorkspaceFileContent(WorkspaceModel):
     sha256: str | None = None
     content: str = ""
     truncated: bool = False
+    next_start_line: int | None = None
     error: str | None = None
 
 

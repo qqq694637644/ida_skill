@@ -4,9 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
-import secrets
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +12,14 @@ from .runtime import env_value_from_environment_or_dotenv
 from .workspace_operations import OperationSettings, WorkspaceOperationManager
 from .workspace_patch import (
     WorkspaceToolError,
-    apply_text_patch,
     assert_payload_size,
     assert_text_bytes,
+    commit_prepared_changes,
     describe_changes,
     normalize_line_endings,
     parse_codex_patch,
-    restore_files,
+    prepare_text_patch,
+    prepare_write_change,
     sha256_hex,
     snapshot_files,
     target_path,
@@ -234,18 +233,15 @@ class LocalWorkspaceService:
         changed: list[dict[str, object]] = []
         diff_stat = ""
         if operation != "unchanged":
-            snapshots = snapshot_files(root, [path])
-            try:
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                temporary = resolved.with_name(f"{resolved.name}.{secrets.token_hex(4)}.tmp")
-                temporary.write_bytes(data)
-                os.replace(temporary, resolved)
-                changed, diff_stat = describe_changes(root, snapshots)
-                if dry_run:
-                    restore_files(root, snapshots)
-            except Exception:
-                restore_files(root, snapshots)
-                raise
+            prepared = prepare_write_change(
+                path=path,
+                resolved_path=resolved,
+                before=previous_bytes,
+                after=data,
+            )
+            changed, diff_stat = describe_changes(prepared)
+            if not dry_run:
+                commit_prepared_changes(root, prepared)
         return {
             "written": operation != "unchanged" and not dry_run,
             "dry_run": dry_run,
@@ -278,20 +274,16 @@ class LocalWorkspaceService:
         )
         paths = list(dict.fromkeys(operation.path for operation in operations))
         snapshots = snapshot_files(root, paths)
-        try:
-            apply_text_patch(root, operations)
-            changed, diff_stat = describe_changes(root, snapshots)
-            if len(changed) > changed_limit:
-                raise WorkspaceToolError(
-                    "WORKSPACE_TOO_MANY_CHANGED_FILES",
-                    f"Patch changes too many files: {len(changed)} > {changed_limit}.",
-                    status_code=413,
-                )
-            if dry_run:
-                restore_files(root, snapshots)
-        except Exception:
-            restore_files(root, snapshots)
-            raise
+        prepared = prepare_text_patch(root, operations, snapshots)
+        changed, diff_stat = describe_changes(prepared)
+        if len(changed) > changed_limit:
+            raise WorkspaceToolError(
+                "WORKSPACE_TOO_MANY_CHANGED_FILES",
+                f"Patch changes too many files: {len(changed)} > {changed_limit}.",
+                status_code=413,
+            )
+        if not dry_run:
+            commit_prepared_changes(root, prepared)
         return {
             "applied": not dry_run,
             "dry_run": dry_run,
@@ -376,32 +368,21 @@ class LocalWorkspaceService:
             args.append("--ignore-case")
         args.extend(["--", query, *normalized_paths])
 
-        def run_rg() -> subprocess.CompletedProcess[bytes]:
-            return subprocess.run(
-                args,
-                cwd=root,
-                capture_output=True,
-                check=False,
-                timeout=120,
-            )
-
-        try:
-            result = await asyncio.to_thread(run_rg)
-        except subprocess.TimeoutExpired as exc:
-            raise WorkspaceToolError(
-                "WORKSPACE_EXEC_TIMEOUT", "ripgrep search timed out.", status_code=504
-            ) from exc
-        if result.returncode == 2:
+        result = await _run_bounded_command(
+            args,
+            cwd=root,
+            timeout_seconds=120,
+            max_output_bytes=max_bytes,
+        )
+        if result["exit_code"] == 2:
             raise WorkspaceToolError(
                 "VALIDATION_ERROR",
                 "ripgrep rejected the search query: "
-                + result.stderr.decode("utf-8", errors="replace"),
+                + result["stderr"].decode("utf-8", errors="replace"),
                 status_code=422,
             )
-        stdout = result.stdout
-        output_truncated = len(stdout) > max_bytes
-        if output_truncated:
-            stdout = stdout[:max_bytes]
+        stdout = result["stdout"]
+        output_truncated = bool(result["truncated"])
         matches: list[dict[str, Any]] = []
         truncated = output_truncated
         for raw_line in stdout.decode("utf-8", errors="replace").splitlines():
@@ -502,6 +483,11 @@ class LocalWorkspaceService:
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "content": content,
                 "truncated": truncated or content_truncated,
+                "next_start_line": (
+                    (end_line + 1 if end_line is not None else start_line)
+                    if truncated or content_truncated
+                    else None
+                ),
                 "error": None,
             }
         except Exception as exc:
@@ -515,6 +501,7 @@ class LocalWorkspaceService:
                 "sha256": None,
                 "content": "",
                 "truncated": False,
+                "next_start_line": None,
                 "error": message,
             }
 
@@ -595,6 +582,70 @@ def _display_path(root: Path, path: Path) -> str:
         return path.relative_to(root).as_posix()
     except ValueError:
         return str(path).replace("\\", "/")
+
+
+async def _run_bounded_command(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    budget = {"remaining": max_output_bytes, "truncated": False}
+    budget_lock = asyncio.Lock()
+    stdout_task = asyncio.create_task(
+        _drain_bounded_stream(proc.stdout, budget=budget, lock=budget_lock)
+    )
+    stderr_task = asyncio.create_task(
+        _drain_bounded_stream(proc.stderr, budget=budget, lock=budget_lock)
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+    except TimeoutError as exc:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        raise WorkspaceToolError(
+            "WORKSPACE_EXEC_TIMEOUT",
+            "ripgrep search timed out.",
+            status_code=504,
+        ) from exc
+    stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+    return {
+        "exit_code": proc.returncode or 0,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": bool(budget["truncated"]),
+    }
+
+
+async def _drain_bounded_stream(
+    stream: asyncio.StreamReader | None,
+    *,
+    budget: dict[str, int | bool],
+    lock: asyncio.Lock,
+) -> bytes:
+    if stream is None:
+        return b""
+    collected = bytearray()
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            return bytes(collected)
+        async with lock:
+            remaining = int(budget["remaining"])
+            accepted = chunk[:remaining]
+            budget["remaining"] = remaining - len(accepted)
+            if len(accepted) < len(chunk):
+                budget["truncated"] = True
+        collected.extend(accepted)
 
 
 def _clip_text_to_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
