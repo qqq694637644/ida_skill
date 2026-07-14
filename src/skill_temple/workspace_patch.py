@@ -321,22 +321,10 @@ def commit_prepared_changes(root: Path, changes: list[PreparedFileChange]) -> No
         raise
     cleanup_error = _cleanup_transaction_dir(transaction_dir, transaction_parent)
     if cleanup_error is not None:
-        rollback_errors = _rollback_committed_changes(committed, backups)
-        _remove_created_dirs(created_dirs, root)
-        retry_cleanup_error = _cleanup_transaction_dir(transaction_dir, transaction_parent)
-        if rollback_errors or retry_cleanup_error is not None:
-            details = list(rollback_errors)
-            if retry_cleanup_error is not None:
-                details.append(str(retry_cleanup_error))
-            raise WorkspaceToolError(
-                "WORKSPACE_TRANSACTION_RECOVERY_FAILED",
-                "Workspace transaction cleanup failed and rollback was incomplete: "
-                + "; ".join(details),
-                status_code=500,
-            ) from cleanup_error
         raise WorkspaceToolError(
             "WORKSPACE_TRANSACTION_CLEANUP_FAILED",
-            "Workspace transaction cleanup failed; committed changes were rolled back: "
+            "Workspace changes were committed, but transaction cleanup failed. "
+            "The committed files were left intact: "
             f"{cleanup_error}",
             status_code=500,
         ) from cleanup_error
@@ -350,12 +338,19 @@ def _rollback_committed_changes(
     for change in reversed(committed):
         target = change.resolved_path
         try:
-            if target.exists() and target.is_file():
-                target.unlink()
-            backup = backups.get(change.path)
-            if backup is not None and backup.exists():
+            if change.before is not None:
+                backup = backups.get(change.path)
+                if backup is None or not backup.exists():
+                    errors.append(
+                        f"{change.path}: backup is unavailable; the current target was left intact"
+                    )
+                    continue
+                if target.exists() and target.is_file():
+                    target.unlink()
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(backup, target)
+            elif target.exists() and target.is_file():
+                target.unlink()
         except OSError as exc:
             errors.append(f"{change.path}: {exc}")
     return errors

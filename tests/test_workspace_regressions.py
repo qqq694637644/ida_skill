@@ -24,6 +24,7 @@ from skill_temple.workspace_operations import OperationSettings, WorkspaceOperat
 from skill_temple.workspace_patch import (
     PreparedFileChange,
     WorkspaceToolError,
+    _rollback_committed_changes,
     commit_prepared_changes,
     describe_changes,
 )
@@ -205,7 +206,7 @@ def test_partial_stage_write_is_registered_and_cleaned() -> None:
         assert not transaction_parent.exists()
 
 
-def test_cleanup_failure_rolls_back_committed_change() -> None:
+def test_partial_cleanup_failure_preserves_committed_change() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp) / "workspace"
         root.mkdir()
@@ -219,22 +220,48 @@ def test_cleanup_failure_rolls_back_committed_change() -> None:
         )
         transaction_parent = root.parent / ".ida-skill-workspace-transactions"
         real_rmtree = shutil.rmtree
-        calls = 0
 
-        def fail_once(path: str | os.PathLike[str], *args, **kwargs) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise PermissionError("injected cleanup failure")
-            real_rmtree(path, *args, **kwargs)
+        def delete_backups_then_fail(
+            path: str | os.PathLike[str],
+            *args,
+            **kwargs,
+        ) -> None:
+            transaction_dir = Path(path)
+            backups = transaction_dir / "backups"
+            if backups.exists():
+                real_rmtree(backups)
+            raise PermissionError("injected failure after backups were deleted")
 
-        with patch("skill_temple.workspace_patch.shutil.rmtree", side_effect=fail_once):
+        with patch(
+            "skill_temple.workspace_patch.shutil.rmtree",
+            side_effect=delete_backups_then_fail,
+        ):
             with pytest.raises(WorkspaceToolError) as exc:
                 commit_prepared_changes(root, [change])
 
         assert exc.value.code == "WORKSPACE_TRANSACTION_CLEANUP_FAILED"
-        assert target.read_bytes() == b"before\n"
-        assert not transaction_parent.exists()
+        assert "committed files were left intact" in exc.value.message
+        assert target.read_bytes() == b"after\n"
+        assert transaction_parent.exists()
+
+
+def test_rollback_without_backup_keeps_current_target() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        target = Path(temp) / "alpha.txt"
+        target.write_bytes(b"committed\n")
+        change = PreparedFileChange(
+            path="alpha.txt",
+            resolved_path=target,
+            before=b"before\n",
+            after=b"committed\n",
+        )
+
+        errors = _rollback_committed_changes([change], {})
+
+        assert errors == [
+            "alpha.txt: backup is unavailable; the current target was left intact"
+        ]
+        assert target.read_bytes() == b"committed\n"
 
 
 def test_long_single_line_does_not_advance_continuation() -> None:

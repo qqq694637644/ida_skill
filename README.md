@@ -197,9 +197,12 @@ require `rg` on `PATH`.
 Deletion requires `allow_delete=true`. Write and patch dry-runs calculate changes entirely
 in memory and never create, replace, delete, or restore files. A real multi-file patch is
 fully parsed and validated in memory first; new contents are staged before commit, and
-per-file backups are used to roll back commit or cleanup errors. Transaction files live in
+per-file backups are used to roll back commit errors. Transaction files live in
 a same-volume sibling runtime directory named `.ida-skill-workspace-transactions`, outside
-`WORKSPACE_ROOT`, so they do not appear in inspect/search results for the target folder.
+`WORKSPACE_ROOT`, so they do not appear in inspect/search results for the target folder. If
+destructive transaction cleanup fails after files were committed, the committed files are
+left intact and the request reports a cleanup error; remaining transaction metadata is
+preserved for diagnosis instead of attempting an unsafe rollback with missing backups.
 
 `changed_files` and `diff_stat` describe this request relative to the file contents present
 when the request started; they are not version-control status. Truncated file reads never
