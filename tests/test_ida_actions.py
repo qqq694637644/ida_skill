@@ -87,7 +87,29 @@ class FakeIdaServer:
         if endpoint == "/decompile":
             return {"name": data["name"], "pseudocode": "int main() { return 0; }"}
         if endpoint == "/xrefs":
-            return {"returned": 1, "xrefs": [{"from_name": "caller", "to_name": data["name"]}]}
+            return {
+                "returned": 2,
+                "xrefs": [
+                    {
+                        "from_name": "data_caller",
+                        "to_name": data["name"],
+                        "type": 1,
+                        "type_name": "offset",
+                        "is_code": False,
+                        "user": False,
+                        "source_disassembly": "dq offset main",
+                    },
+                    {
+                        "from_name": "code_caller",
+                        "to_name": data["name"],
+                        "type": 17,
+                        "type_name": "call_near",
+                        "is_code": True,
+                        "user": False,
+                        "source_disassembly": "call main",
+                    },
+                ],
+            }
         if endpoint == "/execute":
             return {"status": "ok", "result": 3, "stdout": "", "stderr": ""}
         raise AssertionError(f"unexpected endpoint {endpoint}")
@@ -255,6 +277,12 @@ def test_ida_action_endpoints_call_ida_server(monkeypatch) -> None:
 
     xrefs = client.post("/v1/ida/xrefs", json={"name": "main", "direction": "to"}).json()
     assert xrefs["xrefs"][0]["to_name"] == "main"
+    assert xrefs["xrefs"][0]["type"] == 1
+    assert xrefs["xrefs"][0]["type_name"] == "offset"
+    assert xrefs["xrefs"][0]["is_code"] is False
+    assert xrefs["xrefs"][1]["type"] == 17
+    assert xrefs["xrefs"][1]["type_name"] == "call_near"
+    assert xrefs["xrefs"][1]["is_code"] is True
 
     execute = client.post("/v1/ida/execute", json={"code": "result = 1 + 2"}).json()
     assert execute["status"] == "ok"
