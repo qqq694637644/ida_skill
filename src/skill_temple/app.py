@@ -32,6 +32,7 @@ from .runtime import (
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+from .workspace_actions import register_workspace_actions
 
 BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
 
@@ -479,6 +480,7 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             raise HTTPException(status_code=404, detail=detail) from exc
 
     register_ida_actions(app)
+    register_workspace_actions(app)
 
     return app
 
@@ -589,6 +591,36 @@ CONSOLE_HTML = """<!doctype html>
         method: 'POST',
         url: '/v1/skills/read',
         body: {skill_id: 'idapython', path: 'SKILL.md', start_line: 1, max_lines: 80}
+      },
+      workspaceInspect: {
+        method: 'POST',
+        url: '/v1/workspace/inspect',
+        body: {paths: ['.'], queries: [], max_depth: 2, max_tree_entries: 200}
+      },
+      workspaceSearch: {
+        method: 'POST',
+        url: '/v1/workspace/search',
+        body: {query: 'TODO', paths: ['.'], context_lines: 2, max_matches: 50}
+      },
+      workspaceReadFiles: {
+        method: 'POST',
+        url: '/v1/workspace/read-files',
+        body: {paths: ['README.md'], start_line: 1, max_lines: 120}
+      },
+      workspaceWriteFile: {
+        method: 'POST',
+        url: '/v1/workspace/write-file',
+        body: {path: 'example.txt', content: 'example\n', mode: 'create_only'}
+      },
+      workspaceApplyPatch: {
+        method: 'POST',
+        url: '/v1/workspace/apply-patch',
+        body: {patch: '*** Begin Patch\n*** Add File: example.txt\n+example\n*** End Patch\n'}
+      },
+      workspaceCommand: {
+        method: 'POST',
+        url: '/v1/workspace/command',
+        body: {action: 'list'}
       },
       listIdaInstances: {method: 'POST', url: '/v1/ida/instances', body: {}},
       getIdaDatabaseInfo: {method: 'POST', url: '/v1/ida/database-info', body: {}},
