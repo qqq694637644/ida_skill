@@ -237,10 +237,16 @@ def prepare_text_patch(
             )
             lines, trailing = _split_text_lines(original_text)
             new_lines = _apply_hunks(lines, operation.hunks, operation.path)
-            current[operation.path] = _join_lines(
+            new_text = _join_lines(
                 new_lines,
                 trailing_newline=trailing,
-            ).encode("utf-8")
+            )
+            new_text = normalize_line_endings(
+                new_text,
+                line_ending="preserve",
+                previous_bytes=original,
+            )
+            current[operation.path] = new_text.encode("utf-8")
     return [
         PreparedFileChange(
             path=snapshot.path,
