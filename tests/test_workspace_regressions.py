@@ -324,6 +324,45 @@ def test_newline_only_change_has_nonzero_line_counts() -> None:
     assert "+1 -1" in diff_stat
 
 
+def test_apply_patch_preserves_crlf_and_reports_only_changed_lines() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        target = root / "alpha.txt"
+        original = b"one\r\ntwo\r\nthree\r\n"
+        target.write_bytes(original)
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: alpha.txt\n"
+            "@@\n"
+            " one\n"
+            "-two\n"
+            "+changed\n"
+            " three\n"
+            "*** End Patch\n"
+        )
+        client = _client(root)
+        try:
+            dry_run = client.post(
+                "/v1/workspace/apply-patch",
+                json={"patch": patch_text, "dry_run": True},
+            )
+            assert dry_run.status_code == 200, dry_run.text
+            assert dry_run.json()["changed_files"][0]["additions"] == 1
+            assert dry_run.json()["changed_files"][0]["deletions"] == 1
+            assert target.read_bytes() == original
+
+            applied = client.post(
+                "/v1/workspace/apply-patch",
+                json={"patch": patch_text},
+            )
+            assert applied.status_code == 200, applied.text
+            assert applied.json()["changed_files"][0]["additions"] == 1
+            assert applied.json()["changed_files"][0]["deletions"] == 1
+            assert target.read_bytes() == b"one\r\nchanged\r\nthree\r\n"
+        finally:
+            _close_client(client)
+
+
 def test_read_files_returns_next_start_line_when_truncated() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
